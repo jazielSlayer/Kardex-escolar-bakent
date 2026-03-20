@@ -1,0 +1,188 @@
+@api = http://localhost:3700
+
+# ═══════════════════════════════════════════════════════════════
+#  ADMIN — PRUEBAS DE ENDPOINTS
+#  Archivo: admin.http
+#  Usar con: REST Client (VS Code) o IntelliJ HTTP Client
+# ═══════════════════════════════════════════════════════════════
+
+
+# ───────────────────────────────────────────────────────────────
+# 1. DASHBOARD KPI
+#    Todos los indicadores del día en un solo request
+# ───────────────────────────────────────────────────────────────
+
+### 1.1 KPIs del panel principal
+GET {{api}}/dashboard/kpi
+Content-Type: application/json
+
+
+# ───────────────────────────────────────────────────────────────
+# 2. RESUMEN DE ESTUDIANTES
+# ───────────────────────────────────────────────────────────────
+
+### 2.1 Resumen del año académico ACTUAL (sin parámetro)
+GET {{api}}/estudiantes/resumen
+Content-Type: application/json
+
+###
+
+### 2.2 Resumen de un año académico específico (id=1 → 2026)
+GET {{api}}/estudiantes/resumen?anio=1
+Content-Type: application/json
+
+
+# ───────────────────────────────────────────────────────────────
+# 3. RESUMEN DE ANOTACIONES DISCIPLINARIAS
+# ───────────────────────────────────────────────────────────────
+
+### 3.1 Anotaciones del año completo (desde inicio del año académico hasta hoy)
+GET {{api}}/anotaciones/resumen
+Content-Type: application/json
+
+###
+
+### 3.2 Anotaciones de un rango de fechas específico
+GET {{api}}/anotaciones/resumen?inicio=2026-02-01&fin=2026-03-15
+Content-Type: application/json
+
+###
+
+### 3.3 Solo un mes
+GET {{api}}/anotaciones/resumen?inicio=2026-03-01&fin=2026-03-31
+Content-Type: application/json
+
+
+# ───────────────────────────────────────────────────────────────
+# 4. RESUMEN DE MOVIMIENTOS (bajas, traslados, reingresos)
+# ───────────────────────────────────────────────────────────────
+
+### 4.1 Movimientos del año académico ACTUAL
+GET {{api}}/movimientos/resumen
+Content-Type: application/json
+
+###
+
+### 4.2 Movimientos de un año académico específico
+GET {{api}}/movimientos/resumen?anio=1
+Content-Type: application/json
+
+
+# ───────────────────────────────────────────────────────────────
+# 5. CÁRDEX — LISTA GENERAL
+# ───────────────────────────────────────────────────────────────
+
+### 5.1 Todos los estudiantes activos del año actual
+GET {{api}}/cardex?estado=Activo
+Content-Type: application/json
+
+###
+
+### 5.2 Todos los estudiantes sin filtro
+GET {{api}}/cardex
+Content-Type: application/json
+
+###
+
+### 5.3 Solo estudiantes de 5to Primaria A (grado id=8)
+GET {{api}}/cardex?grado=8
+Content-Type: application/json
+
+###
+
+### 5.4 Solo estudiantes de 6to Primaria A (grado id=9)
+GET {{api}}/cardex?grado=9
+Content-Type: application/json
+
+###
+
+### 5.5 Solo estudiantes de 1ro Secundaria A (grado id=10)
+GET {{api}}/cardex?grado=10
+Content-Type: application/json
+
+###
+
+### 5.6 Con todos los filtros combinados
+GET {{api}}/cardex?anio=1&grado=8&estado=Activo
+Content-Type: application/json
+
+###
+
+### 5.7 Estudiantes retirados
+GET {{api}}/cardex?estado=Retirado
+Content-Type: application/json
+
+
+# ───────────────────────────────────────────────────────────────
+# 6. CÁRDEX INDIVIDUAL — 12 secciones completas
+# ───────────────────────────────────────────────────────────────
+
+### 6.1 Cárdex de Diego Vargas (id=1) — todos los años
+GET {{api}}/cardex/1
+Content-Type: application/json
+
+###
+
+### 6.2 Cárdex de Diego Vargas (id=1) — solo año 2026
+GET {{api}}/cardex/1?anio=1
+Content-Type: application/json
+
+###
+
+### 6.3 Cárdex de Santiago Sánchez (id=3) — tiene anotaciones disciplinarias
+GET {{api}}/cardex/3
+Content-Type: application/json
+
+###
+
+### 6.4 Cárdex de Mateo Castro (id=5) — está en 1ro Secundaria
+GET {{api}}/cardex/5
+Content-Type: application/json
+
+###
+
+### 6.5 Cárdex de Valentina Mamani (id=10) — inscripción nueva 2026
+GET {{api}}/cardex/10
+Content-Type: application/json
+
+###
+
+### 6.6 Cárdex con id inexistente — debe devolver 404
+GET {{api}}/cardex/9999
+Content-Type: application/json
+
+###
+
+### 6.7 Cárdex con id inválido — debe devolver 400
+GET {{api}}/cardex/abc
+Content-Type: application/json
+
+
+# ───────────────────────────────────────────────────────────────
+# 7. REPORTE FINANCIERO
+# ───────────────────────────────────────────────────────────────
+
+### 7.1 Reporte financiero del año ACTUAL
+GET {{api}}/financiero/reporte
+Content-Type: application/json
+
+###
+
+### 7.2 Reporte financiero año específico (id=1 → 2026)
+GET {{api}}/financiero/reporte?anio=1
+Content-Type: application/json
+
+
+# ───────────────────────────────────────────────────────────────
+# 8. REPORTE DE RENDIMIENTO ACADÉMICO
+# ───────────────────────────────────────────────────────────────
+
+### 8.1 Rendimiento del año ACTUAL
+GET {{api}}/rendimiento/reporte
+Content-Type: application/json
+
+###
+
+### 8.2 Rendimiento año específico (id=1 → 2026)
+GET {{api}}/rendimiento/reporte?anio=1
+Content-Type: application/json
