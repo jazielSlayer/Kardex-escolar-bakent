@@ -1,0 +1,34 @@
+@api = http://localhost:3700
+
+###
+POST {{api}}/anotaciones/registrar
+Content-Type: application/json
+
+{
+  "nombre_estudiante":   "Santiago",
+  "apellido_estudiante": "Sánchez",
+  "nombre_reporta":      "María",
+  "apellido_reporta":    "Rodríguez",
+  "tipo_falta":          "Moderada",
+  "categoria":           "Conducta",
+  "descripcion":         "Interrumpió la clase reiteradamente.",
+  "sancion":             "Citación a padres",
+  "notificado_padres":   0
+}
+
+###
+GET {{api}}/anotaciones/estudiante?nombre=Santiago&apellido=Sánchez
+
+###
+GET {{api}}/anotaciones/obtener
+###
+PATCH {{api}}/anotaciones/estado
+Content-Type: application/json
+
+{
+  "nombre": "Santiago",
+  "apellido": "Sánchez",
+  "fecha_incidente": "2026-03-15",
+  "estado": "En_proceso",
+  "seguimiento": "Se citó a los padres para el día 20 de marzo."
+}
