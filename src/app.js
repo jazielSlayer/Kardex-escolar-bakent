@@ -6,6 +6,7 @@ import swaggerJSDoc from 'swagger-jsdoc';
 import swaggerUi from 'swagger-ui-express';
 import { options } from './SwagerrOptions';
 
+import Verificacion from './Routes/Verificacion.js'
 
 import Estudiante from './Routes/Estudiantes'
 import Anotacion from './Routes/Anotaciones'
@@ -29,7 +30,7 @@ app.use(express.urlencoded({ extended: true }));
 app.use(Estudiante)
 app.use(Anotacion)
 app.use(Admin)
-
+app.use(Verificacion)
 
 app.use('/docs', swaggerUi.serve, swaggerUi.setup(specs));
 

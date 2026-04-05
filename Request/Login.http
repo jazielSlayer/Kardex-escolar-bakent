@@ -1,0 +1,31 @@
+### Login con 2FA
+POST http://localhost:3700/auth/login
+Content-Type: application/json
+
+{
+  "correo": "jazielarmandovargaschoque@gmail.com",
+  "password": "$2y$10$IrD8GWE5p6jnhbC5.LeXNuh7xIoAFmCJXf8Nht8PkZu0oHXGEMMFO"
+}
+
+###
+
+### Generar código
+POST http://localhost:3700/auth/2fa/generar
+Content-Type: application/json
+
+{
+  "id_user": 21,
+  "metodo": "Email"
+}
+
+###
+
+### Verificar código
+POST http://localhost:3700/auth/2fa/verificar
+Content-Type: application/json
+
+{
+  "id_user": 21,
+  "id_verificacion": 64,
+  "codigo": "759935"
+}

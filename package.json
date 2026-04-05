@@ -15,12 +15,15 @@
     "@babel/runtime": "^7.28.6",
     "bcrypt": "^6.0.0",
     "cors": "^2.8.6",
+    "dns": "^0.2.2",
     "dotenv": "^17.3.1",
     "express": "^5.2.1",
     "morgan": "^1.10.1",
     "mysql2": "^3.18.2",
+    "nodemailer": "^8.0.4",
     "swagger-jsdoc": "^6.2.8",
-    "swagger-ui-express": "^5.0.1"
+    "swagger-ui-express": "^5.0.1",
+    "twilio": "^5.13.1"
   },
   "devDependencies": {
     "@babel/cli": "^7.28.6",
