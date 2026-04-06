@@ -3,7 +3,7 @@
 -- https://www.phpmyadmin.net/
 --
 -- Servidor: 127.0.0.1
--- Tiempo de generación: 20-03-2026 a las 16:00:41
+-- Tiempo de generación: 06-04-2026 a las 21:52:31
 -- Versión del servidor: 10.4.32-MariaDB
 -- Versión de PHP: 8.1.25
 
@@ -1403,6 +1403,134 @@ CREATE DEFINER=`root`@`localhost` PROCEDURE `sp_eliminar_padre_por_nombre` (IN `
     SET p_mensaje = CONCAT('Se eliminaron (desactivaron) ', v_count, ' padre(s)/tutor(es) exitosamente.');
 END$$
 
+CREATE DEFINER=`root`@`localhost` PROCEDURE `sp_generar_codigo_2fa` (IN `p_id_user` BIGINT, IN `p_metodo` ENUM('Email','Telefono'), IN `p_ip` VARCHAR(45), OUT `p_id_verificacion` BIGINT, OUT `p_destino` VARCHAR(255), OUT `p_mensaje` VARCHAR(500))   proc: BEGIN
+
+    DECLARE v_estado_user   VARCHAR(20);
+    DECLARE v_id_persona    BIGINT;
+    DECLARE v_email         VARCHAR(255);
+    DECLARE v_telefono      VARCHAR(50);
+    DECLARE v_codigo        VARCHAR(6);
+    DECLARE v_token         VARCHAR(255);
+    DECLARE v_expiracion    TIMESTAMP;
+    DECLARE v_intentos_hoy  INT DEFAULT 0;
+
+    DECLARE EXIT HANDLER FOR SQLEXCEPTION
+    BEGIN
+        ROLLBACK;
+        SET p_id_verificacion = NULL;
+        SET p_destino         = NULL;
+        SET p_mensaje = 'Error: No se pudo generar el código de verificación.';
+    END;
+
+    START TRANSACTION;
+
+    -- ── 1. Validar que el usuario existe y está activo ──────────
+    SELECT u.Estado, u.ID_Persona
+    INTO   v_estado_user, v_id_persona
+    FROM   users u
+    WHERE  u.id = p_id_user;
+
+    IF v_id_persona IS NULL THEN
+        ROLLBACK;
+        SET p_mensaje = 'Error: Usuario no encontrado.';
+        LEAVE proc;
+    END IF;
+
+    IF v_estado_user NOT IN ('Activo') THEN
+        ROLLBACK;
+        SET p_mensaje = CONCAT('Error: El usuario se encuentra en estado "', v_estado_user, '".');
+        LEAVE proc;
+    END IF;
+
+    -- ── 2. Verificar límite de solicitudes (máx 5 por hora) ─────
+    SELECT COUNT(*)
+    INTO   v_intentos_hoy
+    FROM   verificacion v
+    INNER JOIN users u ON u.ID_Verificacion = v.id
+    WHERE  u.id         = p_id_user
+      AND  v.Tipo       = p_metodo
+      AND  v.Fecha_verificacion >= DATE_SUB(NOW(), INTERVAL 1 HOUR)
+      AND  v.Estado IN ('Pendiente','Expirado');
+
+    IF v_intentos_hoy >= 5 THEN
+        ROLLBACK;
+        SET p_mensaje = 'Error: Ha superado el límite de solicitudes. Intente nuevamente en 1 hora.';
+        LEAVE proc;
+    END IF;
+
+    -- ── 3. Obtener destino según método ─────────────────────────
+    SELECT p.Email_personal, p.Telefono
+    INTO   v_email, v_telefono
+    FROM   persona p
+    WHERE  p.id = v_id_persona;
+
+    IF p_metodo = 'Email' THEN
+        -- Usar el correo institucional del users
+        SELECT u.Correo INTO v_email FROM users u WHERE u.id = p_id_user;
+        IF v_email IS NULL OR TRIM(v_email) = '' THEN
+            ROLLBACK;
+            SET p_mensaje = 'Error: El usuario no tiene correo electrónico registrado.';
+            LEAVE proc;
+        END IF;
+        SET p_destino = v_email;
+    ELSE
+        IF v_telefono IS NULL OR TRIM(v_telefono) = '' THEN
+            ROLLBACK;
+            SET p_mensaje = 'Error: El usuario no tiene número de teléfono registrado.';
+            LEAVE proc;
+        END IF;
+        SET p_destino = v_telefono;
+    END IF;
+
+    -- ── 4. Expirar códigos anteriores pendientes del mismo método
+    UPDATE verificacion v
+    INNER JOIN users u ON u.ID_Verificacion = v.id
+    SET    v.Estado = 'Expirado'
+    WHERE  u.id     = p_id_user
+      AND  v.Tipo   = p_metodo
+      AND  v.Estado = 'Pendiente';
+
+    -- ── 5. Generar código de 6 dígitos ──────────────────────────
+    SET v_codigo     = LPAD(FLOOR(RAND() * 1000000), 6, '0');
+    SET v_expiracion = DATE_ADD(NOW(), INTERVAL 10 MINUTE);
+    SET v_token      = CONCAT(
+        v_codigo, '|',
+        MD5(CONCAT(p_id_user, v_codigo, NOW(), RAND()))
+    );
+
+    -- ── 6. Insertar en verificacion ─────────────────────────────
+    INSERT INTO verificacion (Tipo, Token, Estado, Fecha_expiracion)
+    VALUES (p_metodo, v_token, 'Pendiente', v_expiracion);
+
+    SET p_id_verificacion = LAST_INSERT_ID();
+
+    -- ── 7. Vincular al usuario ───────────────────────────────────
+    UPDATE users
+    SET    ID_Verificacion = p_id_verificacion
+    WHERE  id = p_id_user;
+
+    -- ── 8. Auditoría ─────────────────────────────────────────────
+    INSERT INTO auditoria_usuarios (ID_User, Accion, IP_Address, Detalles)
+    VALUES (
+        p_id_user,
+        'LOGIN',
+        p_ip,
+        JSON_OBJECT(
+            'accion',          '2FA_CODIGO_GENERADO',
+            'metodo',          p_metodo,
+            'id_verificacion', p_id_verificacion,
+            'expira_en',       v_expiracion
+        )
+    );
+
+    COMMIT;
+
+    SET p_mensaje = CONCAT(
+        'Código generado. Expira en 10 minutos. Destino: ', p_destino
+    );
+
+END proc$$
+
 CREATE DEFINER=`root`@`localhost` PROCEDURE `sp_historial_estudiante` (IN `p_id_estudiante` BIGINT)   BEGIN
     -- Datos básicos
     SELECT 'DATOS_BASICOS' AS Seccion;
@@ -1766,6 +1894,174 @@ CREATE DEFINER=`root`@`localhost` PROCEDURE `sp_inscribir_estudiante` (IN `p_nom
     );
 
 -- ▼▼▼ CAMBIO: cierre con la misma etiqueta ▼▼▼
+END proc$$
+
+CREATE DEFINER=`root`@`localhost` PROCEDURE `sp_login` (IN `p_correo` VARCHAR(255), IN `p_password` VARCHAR(255), IN `p_ip` VARCHAR(45), IN `p_user_agent` VARCHAR(255), OUT `p_id_user` BIGINT, OUT `p_id_rol` BIGINT, OUT `p_nombre_rol` VARCHAR(50), OUT `p_nombre_completo` VARCHAR(511), OUT `p_requiere_2fa` TINYINT(1), OUT `p_mensaje` VARCHAR(500))   proc: BEGIN
+
+    DECLARE v_password_bd   VARCHAR(255);
+    DECLARE v_estado        VARCHAR(20);
+    DECLARE v_intentos      INT DEFAULT 0;
+    DECLARE v_id_persona    BIGINT;
+    DECLARE v_nivel_acceso  INT DEFAULT 1;
+
+    DECLARE EXIT HANDLER FOR SQLEXCEPTION
+    BEGIN
+        ROLLBACK;
+        SET p_id_user      = NULL;
+        SET p_id_rol       = NULL;
+        SET p_nombre_rol   = NULL;
+        SET p_nombre_completo = NULL;
+        SET p_requiere_2fa = 0;
+        SET p_mensaje = 'Error: Fallo en el sistema de autenticación.';
+    END;
+
+    START TRANSACTION;
+
+    -- ── 1. Validar campos obligatorios ───────────────────────────
+    IF p_correo IS NULL OR TRIM(p_correo) = '' OR
+       p_password IS NULL OR TRIM(p_password) = '' THEN
+        ROLLBACK;
+        SET p_mensaje = 'Error: Correo y contraseña son obligatorios.';
+        LEAVE proc;
+    END IF;
+
+    -- ── 2. Buscar usuario por correo ─────────────────────────────
+    SELECT
+        u.id,
+        u.Password,
+        u.Estado,
+        u.Intentos_fallidos,
+        u.ID_Persona,
+        u.ID_Rol
+    INTO
+        p_id_user,
+        v_password_bd,
+        v_estado,
+        v_intentos,
+        v_id_persona,
+        p_id_rol
+    FROM users u
+    WHERE u.Correo = TRIM(p_correo)
+    LIMIT 1;
+
+    -- ── 3. Usuario no encontrado ─────────────────────────────────
+    IF p_id_user IS NULL THEN
+        INSERT INTO auditoria_usuarios (ID_User, Accion, IP_Address, User_Agent, Detalles)
+        VALUES (
+            0, 'INTENTO_FALLIDO', p_ip, p_user_agent,
+            JSON_OBJECT('correo_intentado', p_correo, 'motivo', 'usuario_no_existe')
+        );
+        COMMIT;
+        SET p_id_user    = NULL;
+        SET p_requiere_2fa = 0;
+        SET p_mensaje    = 'Error: Credenciales incorrectas.';
+        LEAVE proc;
+    END IF;
+
+    -- ── 4. Cuenta bloqueada ──────────────────────────────────────
+    IF v_estado = 'Bloqueado' THEN
+        INSERT INTO auditoria_usuarios (ID_User, Accion, IP_Address, User_Agent, Detalles)
+        VALUES (
+            p_id_user, 'INTENTO_FALLIDO', p_ip, p_user_agent,
+            JSON_OBJECT('motivo', 'cuenta_bloqueada')
+        );
+        COMMIT;
+        SET p_id_user    = NULL;
+        SET p_requiere_2fa = 0;
+        SET p_mensaje    = 'Error: Cuenta bloqueada. Contacte al administrador.';
+        LEAVE proc;
+    END IF;
+
+    -- ── 5. Cuenta inactiva / suspendida ──────────────────────────
+    IF v_estado NOT IN ('Activo') THEN
+        COMMIT;
+        SET p_id_user    = NULL;
+        SET p_requiere_2fa = 0;
+        SET p_mensaje    = CONCAT('Error: Su cuenta se encuentra en estado "', v_estado, '".');
+        LEAVE proc;
+    END IF;
+
+    -- ── 6. Contraseña incorrecta ─────────────────────────────────
+    IF v_password_bd != p_password THEN
+        UPDATE users
+        SET Intentos_fallidos = Intentos_fallidos + 1
+        WHERE id = p_id_user;
+
+        -- Bloquear si llega a 5 intentos
+        IF v_intentos + 1 >= 5 THEN
+            UPDATE users SET Estado = 'Bloqueado' WHERE id = p_id_user;
+
+            INSERT INTO auditoria_usuarios (ID_User, Accion, IP_Address, User_Agent, Detalles)
+            VALUES (
+                p_id_user, 'BLOQUEO', p_ip, p_user_agent,
+                JSON_OBJECT('motivo', 'maximos_intentos_fallidos', 'intentos', v_intentos + 1)
+            );
+            COMMIT;
+            SET p_id_user    = NULL;
+            SET p_requiere_2fa = 0;
+            SET p_mensaje    = 'Error: Cuenta bloqueada por múltiples intentos fallidos. Contacte al administrador.';
+            LEAVE proc;
+        END IF;
+
+        INSERT INTO auditoria_usuarios (ID_User, Accion, IP_Address, User_Agent, Detalles)
+        VALUES (
+            p_id_user, 'INTENTO_FALLIDO', p_ip, p_user_agent,
+            JSON_OBJECT(
+                'motivo',              'password_incorrecto',
+                'intentos_acumulados', v_intentos + 1,
+                'intentos_restantes',  4 - v_intentos
+            )
+        );
+        COMMIT;
+        SET p_id_user    = NULL;
+        SET p_requiere_2fa = 0;
+        SET p_mensaje    = CONCAT(
+            'Error: Credenciales incorrectas. Intentos restantes: ', (4 - v_intentos), '.'
+        );
+        LEAVE proc;
+    END IF;
+
+    -- ── 7. Login correcto ────────────────────────────────────────
+    UPDATE users
+    SET Intentos_fallidos = 0,
+        Ultimo_acceso     = NOW()
+    WHERE id = p_id_user;
+
+    -- Obtener nombre completo y rol
+    SELECT
+        CONCAT(p.Nombre, ' ', p.Apellido),
+        r.Nombre,
+        r.Nivel_acceso
+    INTO
+        p_nombre_completo,
+        p_nombre_rol,
+        v_nivel_acceso
+    FROM persona p
+    JOIN users   u ON u.ID_Persona = p.id
+    JOIN roles   r ON u.ID_Rol     = r.id
+    WHERE u.id = p_id_user;
+
+    -- Roles con nivel_acceso >= 3 requieren 2FA (Docente, Admin, Director, Secretaria)
+    SET p_requiere_2fa = IF(v_nivel_acceso >= 3, 1, 0);
+
+    INSERT INTO auditoria_usuarios (ID_User, Accion, IP_Address, User_Agent, Detalles)
+    VALUES (
+        p_id_user, 'LOGIN', p_ip, p_user_agent,
+        JSON_OBJECT(
+            'accion',       'LOGIN_PASO_1_OK',
+            'requiere_2fa', p_requiere_2fa,
+            'rol',          p_nombre_rol
+        )
+    );
+
+    COMMIT;
+
+    SET p_mensaje = IF(
+        p_requiere_2fa = 1,
+        'Credenciales correctas. Se requiere verificación en dos pasos.',
+        'Login exitoso.'
+    );
+
 END proc$$
 
 CREATE DEFINER=`root`@`localhost` PROCEDURE `sp_obtener_anotaciones_por_estudiante` (IN `p_nombre` VARCHAR(255), IN `p_apellido` VARCHAR(255))   BEGIN
@@ -2190,6 +2486,155 @@ CREATE DEFINER=`root`@`localhost` PROCEDURE `sp_registrar_login` (IN `p_correo` 
     END IF;
 END$$
 
+CREATE DEFINER=`root`@`localhost` PROCEDURE `sp_verificar_codigo_2fa` (IN `p_id_user` BIGINT, IN `p_id_verificacion` BIGINT, IN `p_codigo` VARCHAR(6), IN `p_ip` VARCHAR(45), OUT `p_verificado` TINYINT(1), OUT `p_mensaje` VARCHAR(500))   proc: BEGIN
+
+    DECLARE v_token          VARCHAR(255);
+    DECLARE v_estado         VARCHAR(20);
+    DECLARE v_expiracion     TIMESTAMP;
+    DECLARE v_codigo_real    VARCHAR(6);
+    DECLARE v_tipo           VARCHAR(20);
+    DECLARE v_intentos_fail  INT DEFAULT 0;
+    DECLARE v_max_intentos   INT DEFAULT 5;
+
+    DECLARE EXIT HANDLER FOR SQLEXCEPTION
+    BEGIN
+        ROLLBACK;
+        SET p_verificado = 0;
+        SET p_mensaje    = 'Error: No se pudo verificar el código.';
+    END;
+
+    START TRANSACTION;
+
+    SET p_verificado = 0;
+
+    -- ── 1. Obtener el registro de verificación ───────────────────
+    SELECT v.Token, v.Estado, v.Fecha_expiracion, v.Tipo
+    INTO   v_token, v_estado, v_expiracion, v_tipo
+    FROM   verificacion v
+    WHERE  v.id = p_id_verificacion;
+
+    IF v_token IS NULL THEN
+        ROLLBACK;
+        SET p_mensaje = 'Error: Código de verificación no encontrado.';
+        LEAVE proc;
+    END IF;
+
+    -- ── 2. Verificar que pertenece al usuario correcto ───────────
+    IF NOT EXISTS (
+        SELECT 1 FROM users
+        WHERE id = p_id_user
+          AND ID_Verificacion = p_id_verificacion
+    ) THEN
+        ROLLBACK;
+        SET p_mensaje = 'Error: El código no corresponde a este usuario.';
+        LEAVE proc;
+    END IF;
+
+    -- ── 3. Verificar estado ─────────────────────────────────────
+    IF v_estado = 'Verificado' THEN
+        ROLLBACK;
+        SET p_mensaje = 'Error: Este código ya fue utilizado.';
+        LEAVE proc;
+    END IF;
+
+    IF v_estado = 'Rechazado' THEN
+        ROLLBACK;
+        SET p_mensaje = 'Error: Este código fue bloqueado por intentos fallidos.';
+        LEAVE proc;
+    END IF;
+
+    IF v_estado = 'Expirado' OR NOW() > v_expiracion THEN
+        -- Marcar como expirado si aún no lo está
+        UPDATE verificacion SET Estado = 'Expirado' WHERE id = p_id_verificacion;
+        COMMIT;
+        SET p_mensaje = 'Error: El código ha expirado. Solicite uno nuevo.';
+        LEAVE proc;
+    END IF;
+
+    -- ── 4. Contar intentos fallidos recientes (últimos 15 min) ───
+    SELECT COUNT(*)
+    INTO   v_intentos_fail
+    FROM   auditoria_usuarios
+    WHERE  ID_User     = p_id_user
+      AND  Accion      = 'INTENTO_FALLIDO'
+      AND  Detalles    LIKE CONCAT('%"id_verificacion":', p_id_verificacion, '%')
+      AND  Fecha_hora >= DATE_SUB(NOW(), INTERVAL 15 MINUTE);
+
+    IF v_intentos_fail >= v_max_intentos THEN
+        UPDATE verificacion SET Estado = 'Rechazado' WHERE id = p_id_verificacion;
+
+        INSERT INTO auditoria_usuarios (ID_User, Accion, IP_Address, Detalles)
+        VALUES (
+            p_id_user, 'BLOQUEO', p_ip,
+            JSON_OBJECT(
+                'accion',          '2FA_CODIGO_BLOQUEADO',
+                'id_verificacion', p_id_verificacion,
+                'intentos',        v_intentos_fail
+            )
+        );
+
+        COMMIT;
+        SET p_mensaje = 'Error: Demasiados intentos fallidos. Solicite un nuevo código.';
+        LEAVE proc;
+    END IF;
+
+    -- ── 5. Extraer el código del token (formato: CODIGO|hash) ────
+    SET v_codigo_real = SUBSTRING_INDEX(v_token, '|', 1);
+
+    -- ── 6. Comparar código ───────────────────────────────────────
+    IF p_codigo != v_codigo_real THEN
+        -- Registrar intento fallido
+        INSERT INTO auditoria_usuarios (ID_User, Accion, IP_Address, Detalles)
+        VALUES (
+            p_id_user, 'INTENTO_FALLIDO', p_ip,
+            JSON_OBJECT(
+                'accion',          '2FA_CODIGO_INCORRECTO',
+                'id_verificacion', p_id_verificacion,
+                'intento_numero',  v_intentos_fail + 1,
+                'intentos_restantes', v_max_intentos - v_intentos_fail - 1
+            )
+        );
+
+        COMMIT;
+        SET p_verificado = 0;
+        SET p_mensaje = CONCAT(
+            'Error: Código incorrecto. Intentos restantes: ',
+            (v_max_intentos - v_intentos_fail - 1), '.'
+        );
+        LEAVE proc;
+    END IF;
+
+    -- ── 7. Código correcto: marcar como verificado ───────────────
+    UPDATE verificacion
+    SET    Estado              = 'Verificado',
+           Fecha_verificacion  = NOW()
+    WHERE  id = p_id_verificacion;
+
+    -- ── 8. Actualizar último acceso del usuario ──────────────────
+    UPDATE users
+    SET    Ultimo_acceso      = NOW(),
+           Intentos_fallidos  = 0
+    WHERE  id = p_id_user;
+
+    -- ── 9. Auditoría de login exitoso 2FA ────────────────────────
+    INSERT INTO auditoria_usuarios (ID_User, Accion, IP_Address, Detalles)
+    VALUES (
+        p_id_user, 'LOGIN', p_ip,
+        JSON_OBJECT(
+            'accion',          '2FA_VERIFICADO',
+            'metodo',          v_tipo,
+            'id_verificacion', p_id_verificacion,
+            'fecha',           NOW()
+        )
+    );
+
+    COMMIT;
+
+    SET p_verificado = 1;
+    SET p_mensaje    = 'Verificación exitosa. Acceso concedido.';
+
+END proc$$
+
 DELIMITER ;
 
 -- --------------------------------------------------------
@@ -2377,7 +2822,9 @@ INSERT INTO `auditoria` (`id`, `ID_User`, `Accion`, `Tabla_afectada`, `ID_Regist
 (20, 2, 'INSERT', 'reportes_disciplinarios', 4, NULL, '{\"id_reporte\": \"4\", \"id_estudiante\": \"3\", \"codigo_estudiante\": \"EST-2026-003\", \"estudiante\": \"Santiago Sánchez\", \"reportado_por\": \"María Rodríguez\", \"tipo_falta\": \"Moderada\", \"categoria\": \"Conducta\", \"fecha_incidente\": \"2026-03-16\", \"fecha_registro\": \"2026-03-16 17:50:08\"}', NULL, NULL, '2026-03-16 21:50:08'),
 (21, 2, 'INSERT', 'reportes_disciplinarios', 5, NULL, '{\"id_reporte\": \"5\", \"id_estudiante\": \"3\", \"codigo_estudiante\": \"EST-2026-003\", \"estudiante\": \"Santiago Sánchez\", \"reportado_por\": \"María Rodríguez\", \"tipo_falta\": \"Moderada\", \"categoria\": \"Disciplinaria\", \"fecha_incidente\": \"2026-03-12\", \"fecha_registro\": \"2026-03-16 17:59:41\"}', NULL, NULL, '2026-03-16 21:59:41'),
 (22, 32, 'INSERT', 'estudiante', 14, NULL, '{\"id\": 14, \"ID_User\": 32, \"Codigo_estudiante\": \"EST-2026-013\", \"Tipo_sangre\": \"A+\", \"Estado\": \"Activo\"}', NULL, NULL, '2026-03-18 00:11:39'),
-(23, 1, 'INSERT', 'inscripcion', 14, NULL, '{\"id_persona\": \"32\", \"id_user\": \"32\", \"id_estudiante\": \"14\", \"codigo_estudiante\": \"EST-2026-013\", \"id_inscripcion\": \"14\", \"id_matricula\": \"13\", \"numero_matricula\": \"MAT-2026-013\", \"id_grado\": \"3\", \"tipo_inscripcion\": \"Reingreso\", \"anio_academico\": \"2026\", \"id_padre1\": \"12\", \"id_padre2\": null, \"registrado_por\": \"1\", \"fecha\": \"2026-03-17 20:11:39\"}', NULL, NULL, '2026-03-18 00:11:39');
+(23, 1, 'INSERT', 'inscripcion', 14, NULL, '{\"id_persona\": \"32\", \"id_user\": \"32\", \"id_estudiante\": \"14\", \"codigo_estudiante\": \"EST-2026-013\", \"id_inscripcion\": \"14\", \"id_matricula\": \"13\", \"numero_matricula\": \"MAT-2026-013\", \"id_grado\": \"3\", \"tipo_inscripcion\": \"Reingreso\", \"anio_academico\": \"2026\", \"id_padre1\": \"12\", \"id_padre2\": null, \"registrado_por\": \"1\", \"fecha\": \"2026-03-17 20:11:39\"}', NULL, NULL, '2026-03-18 00:11:39'),
+(24, 21, 'UPDATE', 'persona', 21, '{\"Nombre\": \"Jaziel\", \"Apellido\": \"Vargas\", \"CI\": \"0288103\", \"Telefono\": \"829092993\", \"Direccion\": \"limanipata\"}', '{\"Nombre\": \"Jaziel\", \"Apellido\": \"Vargas\", \"CI\": \"0288103\", \"Telefono\": \"829092993\", \"Direccion\": \"limanipata\"}', NULL, NULL, '2026-04-04 21:20:45'),
+(25, 21, 'UPDATE', 'persona', 21, '{\"Nombre\": \"Jaziel\", \"Apellido\": \"Vargas\", \"CI\": \"0288103\", \"Telefono\": \"829092993\", \"Direccion\": \"limanipata\"}', '{\"Nombre\": \"Jaziel\", \"Apellido\": \"Vargas\", \"CI\": \"0288103\", \"Telefono\": \"+591 79532646\", \"Direccion\": \"limanipata\"}', NULL, NULL, '2026-04-04 22:05:09');
 
 -- --------------------------------------------------------
 
@@ -2455,7 +2902,9 @@ INSERT INTO `auditoria_personas` (`id`, `ID_Persona_original`, `Datos_completos_
 (9, 30, NULL, '{\"Nombre\": \"sdfg\", \"Apellido\": \"zxcvbn\", \"CI\": \"12345678\", \"Fecha_nacimiento\": \"0456-03-12\", \"Genero\": \"M\", \"Direccion\": \"excvbnm,fdxfcgvh\", \"Telefono\": \"123456789\", \"Email_personal\": \"werctvybnm,kvcgthvbn\", \"Nacionalidad\": \"Boliviana\"}', 'INSERT', NULL, NULL, '2026-03-15 22:51:10'),
 (10, 31, NULL, '{\"Nombre\": \"asdfbvc\", \"Apellido\": \"bvcxzx\", \"CI\": \"zxzxczcac\", \"Fecha_nacimiento\": \"0000-00-00\", \"Genero\": \"\", \"Direccion\": \"\", \"Telefono\": \"\", \"Email_personal\": \"\", \"Nacionalidad\": \"Boliviana\"}', 'INSERT', NULL, NULL, '2026-03-15 22:51:10'),
 (11, 32, NULL, '{\"Nombre\": \"Deybid\", \"Apellido\": \"Choque\", \"CI\": \"1234\", \"Fecha_nacimiento\": \"2026-03-11\", \"Genero\": \"M\", \"Direccion\": \"asdfgbnm\", \"Telefono\": \"12345\", \"Email_personal\": \"asdfg\", \"Nacionalidad\": \"Boliviana\"}', 'INSERT', NULL, NULL, '2026-03-18 00:11:39'),
-(12, 33, NULL, '{\"Nombre\": \"dfghjk\", \"Apellido\": \"fgbhjkl\", \"CI\": \"2345678\", \"Fecha_nacimiento\": \"2026-03-19\", \"Genero\": \"F\", \"Direccion\": \"cvbn\", \"Telefono\": \"345678\", \"Email_personal\": \"xcvbnm\", \"Nacionalidad\": \"Boliviana\"}', 'INSERT', NULL, NULL, '2026-03-18 00:11:39');
+(12, 33, NULL, '{\"Nombre\": \"dfghjk\", \"Apellido\": \"fgbhjkl\", \"CI\": \"2345678\", \"Fecha_nacimiento\": \"2026-03-19\", \"Genero\": \"F\", \"Direccion\": \"cvbn\", \"Telefono\": \"345678\", \"Email_personal\": \"xcvbnm\", \"Nacionalidad\": \"Boliviana\"}', 'INSERT', NULL, NULL, '2026-03-18 00:11:39'),
+(13, 21, '{\"Nombre\": \"Jaziel\", \"Apellido\": \"Vargas\", \"CI\": \"0288103\", \"Fecha_nacimiento\": \"0000-00-00\", \"Genero\": \"M\", \"Direccion\": \"limanipata\", \"Telefono\": \"829092993\", \"Email_personal\": \"ss xns \", \"Nacionalidad\": \"cacscsc\"}', '{\"Nombre\": \"Jaziel\", \"Apellido\": \"Vargas\", \"CI\": \"0288103\", \"Fecha_nacimiento\": \"0000-00-00\", \"Genero\": \"M\", \"Direccion\": \"limanipata\", \"Telefono\": \"829092993\", \"Email_personal\": \"jazielarmandovargaschoque@gmail.com\", \"Nacionalidad\": \"cacscsc\"}', 'UPDATE', 21, NULL, '2026-04-04 21:20:45'),
+(14, 21, '{\"Nombre\": \"Jaziel\", \"Apellido\": \"Vargas\", \"CI\": \"0288103\", \"Fecha_nacimiento\": \"0000-00-00\", \"Genero\": \"M\", \"Direccion\": \"limanipata\", \"Telefono\": \"829092993\", \"Email_personal\": \"jazielarmandovargaschoque@gmail.com\", \"Nacionalidad\": \"cacscsc\"}', '{\"Nombre\": \"Jaziel\", \"Apellido\": \"Vargas\", \"CI\": \"0288103\", \"Fecha_nacimiento\": \"0000-00-00\", \"Genero\": \"M\", \"Direccion\": \"limanipata\", \"Telefono\": \"+591 79532646\", \"Email_personal\": \"jazielarmandovargaschoque@gmail.com\", \"Nacionalidad\": \"cacscsc\"}', 'UPDATE', 21, NULL, '2026-04-04 22:05:09');
 
 -- --------------------------------------------------------
 
@@ -2472,6 +2921,71 @@ CREATE TABLE `auditoria_usuarios` (
   `Detalles` text DEFAULT NULL COMMENT 'JSON con detalles adicionales',
   `Fecha_hora` timestamp NOT NULL DEFAULT current_timestamp()
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_general_ci COMMENT='Auditoría específica de usuarios';
+
+--
+-- Volcado de datos para la tabla `auditoria_usuarios`
+--
+
+INSERT INTO `auditoria_usuarios` (`id`, `ID_User`, `Accion`, `IP_Address`, `User_Agent`, `Detalles`, `Fecha_hora`) VALUES
+(1, 1, 'LOGIN', '::ffff:127.0.0.1', NULL, '{\"accion\": \"2FA_CODIGO_GENERADO\", \"metodo\": \"Email\", \"id_verificacion\": \"33\", \"expira_en\": \"2026-04-04 17:12:19\"}', '2026-04-04 21:02:19'),
+(2, 1, 'LOGIN', '::ffff:127.0.0.1', NULL, '{\"accion\": \"2FA_CODIGO_GENERADO\", \"metodo\": \"Telefono\", \"id_verificacion\": \"34\", \"expira_en\": \"2026-04-04 17:13:12\"}', '2026-04-04 21:03:12'),
+(3, 1, 'LOGIN', '::ffff:127.0.0.1', 'vscode-restclient', '{\"accion\": \"LOGIN_PASO_1_OK\", \"requiere_2fa\": \"1\", \"rol\": \"Administrador\"}', '2026-04-04 21:10:06'),
+(4, 1, 'LOGIN', '::ffff:127.0.0.1', NULL, '{\"accion\": \"2FA_CODIGO_GENERADO\", \"metodo\": \"Email\", \"id_verificacion\": \"35\", \"expira_en\": \"2026-04-04 17:20:19\"}', '2026-04-04 21:10:19'),
+(5, 1, 'LOGIN', '::ffff:127.0.0.1', NULL, '{\"accion\": \"2FA_CODIGO_GENERADO\", \"metodo\": \"Email\", \"id_verificacion\": \"36\", \"expira_en\": \"2026-04-04 17:20:34\"}', '2026-04-04 21:10:34'),
+(6, 1, 'INTENTO_FALLIDO', '::ffff:127.0.0.1', 'vscode-restclient', '{\"motivo\": \"password_incorrecto\", \"intentos_acumulados\": 1, \"intentos_restantes\": 4}', '2026-04-04 21:10:45'),
+(10, 1, 'LOGIN', '::ffff:127.0.0.1', 'vscode-restclient', '{\"accion\": \"LOGIN_PASO_1_OK\", \"requiere_2fa\": \"1\", \"rol\": \"Administrador\"}', '2026-04-04 21:47:04'),
+(14, 21, 'LOGIN', '::ffff:127.0.0.1', 'vscode-restclient', '{\"accion\": \"LOGIN_PASO_1_OK\", \"requiere_2fa\": \"1\", \"rol\": \"Docente\"}', '2026-04-04 21:50:04'),
+(15, 21, 'LOGIN', '::1', 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/145.0.0.0 Safari/537.36 OPR/129.0.0.0', '{\"accion\": \"LOGIN_PASO_1_OK\", \"requiere_2fa\": \"1\", \"rol\": \"Docente\"}', '2026-04-04 21:50:19'),
+(16, 21, 'LOGIN', '::1', 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/145.0.0.0 Safari/537.36 OPR/129.0.0.0', '{\"accion\": \"LOGIN_PASO_1_OK\", \"requiere_2fa\": \"1\", \"rol\": \"Docente\"}', '2026-04-04 21:59:04'),
+(17, 21, 'LOGIN', '::1', NULL, '{\"accion\": \"2FA_CODIGO_GENERADO\", \"metodo\": \"Telefono\", \"id_verificacion\": \"37\", \"expira_en\": \"2026-04-04 18:09:13\"}', '2026-04-04 21:59:13'),
+(18, 21, 'LOGIN', '::1', 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/145.0.0.0 Safari/537.36 OPR/129.0.0.0', '{\"accion\": \"LOGIN_PASO_1_OK\", \"requiere_2fa\": \"1\", \"rol\": \"Docente\"}', '2026-04-05 18:52:29'),
+(19, 21, 'LOGIN', '::1', NULL, '{\"accion\": \"2FA_CODIGO_GENERADO\", \"metodo\": \"Email\", \"id_verificacion\": \"38\", \"expira_en\": \"2026-04-05 15:02:35\"}', '2026-04-05 18:52:35'),
+(20, 21, 'LOGIN', '::1', NULL, '{\"accion\": \"2FA_CODIGO_GENERADO\", \"metodo\": \"Email\", \"id_verificacion\": \"39\", \"expira_en\": \"2026-04-05 15:25:01\"}', '2026-04-05 19:15:01'),
+(21, 21, 'LOGIN', '::1', NULL, '{\"accion\": \"2FA_CODIGO_GENERADO\", \"metodo\": \"Email\", \"id_verificacion\": \"40\", \"expira_en\": \"2026-04-05 15:26:16\"}', '2026-04-05 19:16:16'),
+(22, 21, 'LOGIN', '::1', NULL, '{\"accion\": \"2FA_CODIGO_GENERADO\", \"metodo\": \"Email\", \"id_verificacion\": \"41\", \"expira_en\": \"2026-04-05 15:27:06\"}', '2026-04-05 19:17:06'),
+(23, 21, 'LOGIN', '::1', NULL, '{\"accion\": \"2FA_CODIGO_GENERADO\", \"metodo\": \"Email\", \"id_verificacion\": \"42\", \"expira_en\": \"2026-04-05 15:43:49\"}', '2026-04-05 19:33:49'),
+(24, 21, 'LOGIN', '::ffff:127.0.0.1', NULL, '{\"accion\": \"2FA_CODIGO_GENERADO\", \"metodo\": \"Email\", \"id_verificacion\": \"43\", \"expira_en\": \"2026-04-05 15:44:13\"}', '2026-04-05 19:34:13'),
+(25, 1, 'LOGIN', '::ffff:127.0.0.1', NULL, '{\"accion\": \"2FA_CODIGO_GENERADO\", \"metodo\": \"Email\", \"id_verificacion\": \"44\", \"expira_en\": \"2026-04-05 15:50:41\"}', '2026-04-05 19:40:41'),
+(26, 21, 'LOGIN', '::1', NULL, '{\"accion\": \"2FA_CODIGO_GENERADO\", \"metodo\": \"Email\", \"id_verificacion\": \"45\", \"expira_en\": \"2026-04-05 15:59:25\"}', '2026-04-05 19:49:25'),
+(27, 21, 'LOGIN', '::1', NULL, '{\"accion\": \"2FA_CODIGO_GENERADO\", \"metodo\": \"Email\", \"id_verificacion\": \"46\", \"expira_en\": \"2026-04-05 16:00:06\"}', '2026-04-05 19:50:06'),
+(28, 21, 'LOGIN', '::1', NULL, '{\"accion\": \"2FA_CODIGO_GENERADO\", \"metodo\": \"Email\", \"id_verificacion\": \"47\", \"expira_en\": \"2026-04-05 16:00:30\"}', '2026-04-05 19:50:30'),
+(29, 21, 'LOGIN', '::1', NULL, '{\"accion\": \"2FA_CODIGO_GENERADO\", \"metodo\": \"Email\", \"id_verificacion\": \"48\", \"expira_en\": \"2026-04-05 16:05:23\"}', '2026-04-05 19:55:23'),
+(30, 21, 'LOGIN', '::1', NULL, '{\"accion\": \"2FA_CODIGO_GENERADO\", \"metodo\": \"Email\", \"id_verificacion\": \"49\", \"expira_en\": \"2026-04-05 16:06:18\"}', '2026-04-05 19:56:18'),
+(31, 21, 'LOGIN', '::1', NULL, '{\"accion\": \"2FA_CODIGO_GENERADO\", \"metodo\": \"Email\", \"id_verificacion\": \"50\", \"expira_en\": \"2026-04-05 16:08:01\"}', '2026-04-05 19:58:01'),
+(32, 21, 'LOGIN', '::1', 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/145.0.0.0 Safari/537.36 OPR/129.0.0.0', '{\"accion\": \"LOGIN_PASO_1_OK\", \"requiere_2fa\": \"1\", \"rol\": \"Docente\"}', '2026-04-05 20:21:12'),
+(33, 21, 'LOGIN', '::1', NULL, '{\"accion\": \"2FA_CODIGO_GENERADO\", \"metodo\": \"Email\", \"id_verificacion\": \"51\", \"expira_en\": \"2026-04-05 16:31:13\"}', '2026-04-05 20:21:13'),
+(34, 21, 'LOGIN', '::1', NULL, '{\"accion\": \"2FA_CODIGO_GENERADO\", \"metodo\": \"Email\", \"id_verificacion\": \"52\", \"expira_en\": \"2026-04-05 16:37:03\"}', '2026-04-05 20:27:03'),
+(35, 21, 'LOGIN', '::1', NULL, '{\"accion\": \"2FA_CODIGO_GENERADO\", \"metodo\": \"Email\", \"id_verificacion\": \"53\", \"expira_en\": \"2026-04-05 16:40:13\"}', '2026-04-05 20:30:13'),
+(36, 21, 'LOGIN', '::1', NULL, '{\"accion\": \"2FA_CODIGO_GENERADO\", \"metodo\": \"Email\", \"id_verificacion\": \"54\", \"expira_en\": \"2026-04-05 16:40:34\"}', '2026-04-05 20:30:34'),
+(37, 21, 'LOGIN', '::1', NULL, '{\"accion\": \"2FA_CODIGO_GENERADO\", \"metodo\": \"Email\", \"id_verificacion\": \"55\", \"expira_en\": \"2026-04-05 16:44:49\"}', '2026-04-05 20:34:49'),
+(38, 21, 'LOGIN', '::1', NULL, '{\"accion\": \"2FA_CODIGO_GENERADO\", \"metodo\": \"Email\", \"id_verificacion\": \"56\", \"expira_en\": \"2026-04-05 16:58:58\"}', '2026-04-05 20:48:58'),
+(39, 21, 'LOGIN', '::1', NULL, '{\"accion\": \"2FA_CODIGO_GENERADO\", \"metodo\": \"Email\", \"id_verificacion\": \"57\", \"expira_en\": \"2026-04-05 17:11:17\"}', '2026-04-05 21:01:17'),
+(40, 21, 'LOGIN', '::1', NULL, '{\"accion\": \"2FA_CODIGO_GENERADO\", \"metodo\": \"Email\", \"id_verificacion\": \"58\", \"expira_en\": \"2026-04-05 17:21:29\"}', '2026-04-05 21:11:29'),
+(41, 21, 'LOGIN', '::ffff:127.0.0.1', 'vscode-restclient', '{\"accion\": \"LOGIN_PASO_1_OK\", \"requiere_2fa\": \"1\", \"rol\": \"Docente\"}', '2026-04-05 22:08:16'),
+(42, 21, 'LOGIN', '::ffff:127.0.0.1', 'vscode-restclient', '{\"accion\": \"LOGIN_PASO_1_OK\", \"requiere_2fa\": \"1\", \"rol\": \"Docente\"}', '2026-04-05 22:09:48'),
+(43, 21, 'LOGIN', '::ffff:127.0.0.1', NULL, '{\"accion\": \"2FA_CODIGO_GENERADO\", \"metodo\": \"Email\", \"id_verificacion\": \"59\", \"expira_en\": \"2026-04-05 18:22:57\"}', '2026-04-05 22:12:57'),
+(44, 21, 'LOGIN', '::ffff:127.0.0.1', NULL, '{\"accion\": \"2FA_CODIGO_GENERADO\", \"metodo\": \"Email\", \"id_verificacion\": \"60\", \"expira_en\": \"2026-04-05 18:24:19\"}', '2026-04-05 22:14:19'),
+(45, 21, 'LOGIN', '::ffff:127.0.0.1', NULL, '{\"accion\": \"2FA_CODIGO_GENERADO\", \"metodo\": \"Email\", \"id_verificacion\": \"61\", \"expira_en\": \"2026-04-05 18:26:01\"}', '2026-04-05 22:16:01'),
+(46, 21, 'LOGIN', '::ffff:127.0.0.1', NULL, '{\"accion\": \"2FA_CODIGO_GENERADO\", \"metodo\": \"Email\", \"id_verificacion\": \"62\", \"expira_en\": \"2026-04-05 18:27:00\"}', '2026-04-05 22:17:00'),
+(47, 21, 'LOGIN', '::ffff:127.0.0.1', NULL, '{\"accion\": \"2FA_VERIFICADO\", \"metodo\": \"Email\", \"id_verificacion\": \"62\", \"fecha\": \"2026-04-05 18:17:49\"}', '2026-04-05 22:17:49'),
+(48, 21, 'LOGIN', '::1', NULL, '{\"accion\": \"2FA_CODIGO_GENERADO\", \"metodo\": \"Email\", \"id_verificacion\": \"63\", \"expira_en\": \"2026-04-05 18:35:45\"}', '2026-04-05 22:25:45'),
+(49, 21, 'LOGIN', '::1', NULL, '{\"accion\": \"2FA_VERIFICADO\", \"metodo\": \"Email\", \"id_verificacion\": \"63\", \"fecha\": \"2026-04-05 18:26:12\"}', '2026-04-05 22:26:12'),
+(50, 21, 'LOGIN', '::ffff:127.0.0.1', 'vscode-restclient', '{\"accion\": \"LOGIN_PASO_1_OK\", \"requiere_2fa\": \"1\", \"rol\": \"Docente\"}', '2026-04-05 22:45:11'),
+(51, 21, 'LOGIN', '::ffff:127.0.0.1', NULL, '{\"accion\": \"2FA_CODIGO_GENERADO\", \"metodo\": \"Email\", \"id_verificacion\": \"64\", \"expira_en\": \"2026-04-05 18:55:26\"}', '2026-04-05 22:45:26'),
+(52, 21, 'LOGIN', '::ffff:127.0.0.1', NULL, '{\"accion\": \"2FA_VERIFICADO\", \"metodo\": \"Email\", \"id_verificacion\": \"64\", \"fecha\": \"2026-04-05 18:46:10\"}', '2026-04-05 22:46:10'),
+(53, 21, 'LOGIN', '::1', 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/145.0.0.0 Safari/537.36 OPR/129.0.0.0', '{\"accion\": \"LOGIN_PASO_1_OK\", \"requiere_2fa\": \"1\", \"rol\": \"Docente\"}', '2026-04-05 22:55:32'),
+(54, 21, 'LOGIN', '::1', NULL, '{\"accion\": \"2FA_CODIGO_GENERADO\", \"metodo\": \"Email\", \"id_verificacion\": \"65\", \"expira_en\": \"2026-04-05 19:05:44\"}', '2026-04-05 22:55:44'),
+(55, 21, 'LOGIN', '::1', NULL, '{\"accion\": \"2FA_VERIFICADO\", \"metodo\": \"Email\", \"id_verificacion\": \"65\", \"fecha\": \"2026-04-05 18:56:21\"}', '2026-04-05 22:56:21'),
+(56, 21, 'LOGIN', '::1', 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/145.0.0.0 Safari/537.36 OPR/129.0.0.0', '{\"accion\": \"LOGIN_PASO_1_OK\", \"requiere_2fa\": \"1\", \"rol\": \"Docente\"}', '2026-04-05 22:57:08'),
+(57, 21, 'LOGIN', '::1', NULL, '{\"accion\": \"2FA_CODIGO_GENERADO\", \"metodo\": \"Email\", \"id_verificacion\": \"66\", \"expira_en\": \"2026-04-05 19:07:14\"}', '2026-04-05 22:57:14'),
+(58, 21, 'LOGIN', '::1', NULL, '{\"accion\": \"2FA_VERIFICADO\", \"metodo\": \"Email\", \"id_verificacion\": \"66\", \"fecha\": \"2026-04-05 18:58:01\"}', '2026-04-05 22:58:01'),
+(59, 21, 'LOGIN', '::1', 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/145.0.0.0 Safari/537.36 OPR/129.0.0.0', '{\"accion\": \"LOGIN_PASO_1_OK\", \"requiere_2fa\": \"1\", \"rol\": \"Docente\"}', '2026-04-06 18:23:17'),
+(60, 21, 'INTENTO_FALLIDO', '::1', 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/146.0.0.0 Safari/537.36 Edg/146.0.0.0', '{\"motivo\": \"password_incorrecto\", \"intentos_acumulados\": 1, \"intentos_restantes\": 4}', '2026-04-06 18:24:21'),
+(61, 21, 'LOGIN', '::1', 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/146.0.0.0 Safari/537.36 Edg/146.0.0.0', '{\"accion\": \"LOGIN_PASO_1_OK\", \"requiere_2fa\": \"1\", \"rol\": \"Docente\"}', '2026-04-06 18:24:51'),
+(62, 21, 'LOGIN', '::1', NULL, '{\"accion\": \"2FA_CODIGO_GENERADO\", \"metodo\": \"Email\", \"id_verificacion\": \"67\", \"expira_en\": \"2026-04-06 14:35:03\"}', '2026-04-06 18:25:03'),
+(63, 21, 'LOGIN', '::1', 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/146.0.0.0 Safari/537.36 Edg/146.0.0.0', '{\"accion\": \"LOGIN_PASO_1_OK\", \"requiere_2fa\": \"1\", \"rol\": \"Docente\"}', '2026-04-06 18:27:55'),
+(64, 21, 'LOGIN', '::1', NULL, '{\"accion\": \"2FA_CODIGO_GENERADO\", \"metodo\": \"Email\", \"id_verificacion\": \"68\", \"expira_en\": \"2026-04-06 14:53:44\"}', '2026-04-06 18:43:44'),
+(65, 21, 'LOGIN', '::1', NULL, '{\"accion\": \"2FA_CODIGO_GENERADO\", \"metodo\": \"Email\", \"id_verificacion\": \"69\", \"expira_en\": \"2026-04-06 14:53:53\"}', '2026-04-06 18:43:53');
 
 -- --------------------------------------------------------
 
@@ -3377,7 +3891,7 @@ INSERT INTO `persona` (`id`, `Nombre`, `Apellido`, `CI`, `Fecha_nacimiento`, `Ge
 (18, 'Emma', 'Morales', '4890123-LP', '2015-02-14', 'F', 'Av. del Maestro #654', '72345679', NULL, NULL, NULL, 'Boliviana', '2026-02-15 18:27:25', '2026-02-15 18:27:25'),
 (19, 'Sebastián', 'Torres', '5901234-LP', '2014-09-05', 'M', 'Calle Sucre #234', '73456780', NULL, NULL, NULL, 'Boliviana', '2026-02-15 18:27:25', '2026-02-15 18:27:25'),
 (20, 'Lucía', 'Mendoza', '6012345-LP', '2016-01-18', 'F', 'Av. América #567', '74567891', NULL, NULL, NULL, 'Boliviana', '2026-02-15 18:27:25', '2026-02-15 18:27:25'),
-(21, 'Jaziel', 'Vargas', '0288103', '0000-00-00', 'M', 'limanipata', '829092993', 'ss xns ', 'cscacca', 'cacasc', 'cacscsc', '2026-02-15 22:11:05', '2026-02-15 22:11:05'),
+(21, 'Jaziel', 'Vargas', '0288103', '0000-00-00', 'M', 'limanipata', '+591 79532646', 'jazielarmandovargaschoque@gmail.com', 'cscacca', 'cacasc', 'cacscsc', '2026-02-15 22:11:05', '2026-04-04 22:05:09'),
 (23, 'Valentina', 'Mamani', '1234567-CB', '2015-03-22', 'F', 'Calle Sucre #345, Cochabamba', '76543210', 'vale.mamani@gmail.com', NULL, NULL, 'Boliviana', '2026-03-15 20:30:07', '2026-03-15 20:30:07'),
 (24, 'Jorge', 'Mamani', '4567890', '1978-11-10', 'M', 'Calle Sucre #345, Cochabamba', '71234567', 'jorge.mamani@gmail.com', NULL, 'Casado', 'Boliviana', '2026-03-15 20:30:07', '2026-03-15 20:30:07'),
 (25, 'Rosa', 'Torrez', '5678901', '1981-06-25', 'F', 'Calle Sucre #345, Cochabamba', '72345678', 'rosa.torrez@gmail.com', NULL, 'Casada', 'Boliviana', '2026-03-15 20:30:07', '2026-03-15 20:30:07'),
@@ -3671,7 +4185,7 @@ CREATE TABLE `users` (
 --
 
 INSERT INTO `users` (`id`, `ID_Persona`, `ID_Verificacion`, `ID_Rol`, `Correo`, `Password`, `Estado`, `Ultimo_acceso`, `Intentos_fallidos`, `Fecha_de_creacion`, `Fecha_de_modificacion`) VALUES
-(1, 1, 1, 1, 'admin@colegio.edu.bo', '$2y$10$92IXUNpkjO0rOQ5byMi.Ye4oKoEa3Ro9llC/.og/at2.uheWG/igi', 'Activo', '2026-02-15 12:00:00', 0, '2026-02-15 18:27:25', '2026-02-15 18:27:25'),
+(1, 1, 44, 1, 'admin@colegio.edu.bo', '$2y$10$92IXUNpkjO0rOQ5byMi.Ye4oKoEa3Ro9llC/.og/at2.uheWG/igi', 'Activo', '2026-04-04 21:47:04', 0, '2026-02-15 18:27:25', '2026-04-05 19:40:41'),
 (2, 2, 2, 2, 'maria.rodriguez@colegio.edu.bo', '$2y$10$92IXUNpkjO0rOQ5byMi.Ye4oKoEa3Ro9llC/.og/at2.uheWG/igi', 'Activo', '2026-02-15 11:30:00', 0, '2026-02-15 18:27:25', '2026-02-15 18:27:25'),
 (3, 3, 3, 2, 'juan.perez@colegio.edu.bo', '$2y$10$92IXUNpkjO0rOQ5byMi.Ye4oKoEa3Ro9llC/.og/at2.uheWG/igi', 'Activo', '2026-02-14 20:45:00', 0, '2026-02-15 18:27:25', '2026-02-15 18:27:25'),
 (4, 4, 4, 2, 'ana.lopez@colegio.edu.bo', '$2y$10$92IXUNpkjO0rOQ5byMi.Ye4oKoEa3Ro9llC/.og/at2.uheWG/igi', 'Activo', '2026-02-14 19:20:00', 0, '2026-02-15 18:27:25', '2026-02-15 18:27:25'),
@@ -3691,7 +4205,7 @@ INSERT INTO `users` (`id`, `ID_Persona`, `ID_Verificacion`, `ID_Rol`, `Correo`, 
 (18, 18, 18, 3, 'emma.morales@estudiante.colegio.edu.bo', '$2y$10$92IXUNpkjO0rOQ5byMi.Ye4oKoEa3Ro9llC/.og/at2.uheWG/igi', 'Activo', '2026-02-09 20:00:00', 0, '2026-02-15 18:27:25', '2026-02-15 18:27:25'),
 (19, 19, 19, 3, 'sebastian.torres@estudiante.colegio.edu.bo', '$2y$10$COFZ0Ml935KoioAN7ZigguwbrkcW9g.wUDwGUGqUls5NFkslLSnKi', 'Activo', '2026-02-08 21:00:00', 0, '2026-02-15 18:27:25', '2026-03-13 22:14:28'),
 (20, 20, 20, 3, 'lucia.mendoza@estudiante.colegio.edu.bo', '$2y$10$8F61dyK53hsszzl1AS1.ouVXd3qtZjaHK5J9st7RZ04Fx7EtiktwO', 'Activo', '2026-02-07 20:30:00', 0, '2026-02-15 18:27:25', '2026-03-13 22:17:14'),
-(21, 21, NULL, 2, 'sacscsca', '$2y$10$IrD8GWE5p6jnhbC5.LeXNuh7xIoAFmCJXf8Nht8PkZu0oHXGEMMFO', 'Activo', NULL, 0, '2026-02-15 22:11:05', '2026-03-13 22:13:57'),
+(21, 21, 69, 2, 'jazielarmandovargaschoque@gmail.com', '$2y$10$IrD8GWE5p6jnhbC5.LeXNuh7xIoAFmCJXf8Nht8PkZu0oHXGEMMFO', 'Activo', '2026-04-06 18:27:55', 0, '2026-02-15 22:11:05', '2026-04-06 18:43:53'),
 (23, 23, 22, 3, 'valentina.mamani@estudiante.colegio.edu.bo', '$2y$10$92IXUNpkjO0rOQ5byMi.Ye4oKoEa3Ro9llC/.og/at2.uheWG/igi', 'Activo', NULL, 0, '2026-03-15 20:30:07', '2026-03-15 20:30:07'),
 (24, 24, 23, 4, 'jorge.mamani@gmail.com', '$2y$10$92IXUNpkjO0rOQ5byMi.Ye4oKoEa3Ro9llC/.og/at2.uheWG/igi', 'Activo', NULL, 0, '2026-03-15 20:30:07', '2026-03-15 20:30:07'),
 (25, 25, 24, 4, 'rosa.torrez@gmail.com', '$2y$10$92IXUNpkjO0rOQ5byMi.Ye4oKoEa3Ro9llC/.og/at2.uheWG/igi', 'Activo', NULL, 0, '2026-03-15 20:30:07', '2026-03-15 20:30:07'),
@@ -3754,7 +4268,44 @@ INSERT INTO `verificacion` (`id`, `Fecha_verificacion`, `Tipo`, `Token`, `Estado
 (29, '2026-03-15 22:51:10', 'Email', '59c38ae9bfa03211c1797a6e30cdee9d-1773615070', 'Pendiente', '2026-03-17 22:51:10'),
 (30, '2026-03-15 22:51:10', 'Email', '6979b3cbb6b442d1fadf3ed18138b2d9-1773615070', 'Pendiente', '2026-03-17 22:51:10'),
 (31, '2026-03-18 00:11:39', 'Email', '4c591b3f5c44d3730fb3d29d3ceed258-1773792699', 'Pendiente', '2026-03-20 00:11:39'),
-(32, '2026-03-18 00:11:39', 'Email', '8a3dae3c54defcc6bfda9b567be1b261-1773792699', 'Pendiente', '2026-03-20 00:11:39');
+(32, '2026-03-18 00:11:39', 'Email', '8a3dae3c54defcc6bfda9b567be1b261-1773792699', 'Pendiente', '2026-03-20 00:11:39'),
+(33, '2026-04-04 21:02:19', 'Email', '242122|7e5305dbe0cd21f3796597e3146a4794', 'Pendiente', '2026-04-04 21:12:19'),
+(34, '2026-04-04 21:03:12', 'Telefono', '624491|f24f62d7db9b842a487ce1eb9b939e2b', 'Pendiente', '2026-04-04 21:13:12'),
+(35, '2026-04-04 21:10:19', 'Email', '599233|5a06de3438332a11f814a5cb561925bd', 'Expirado', '2026-04-04 21:20:19'),
+(36, '2026-04-04 21:10:34', 'Email', '653059|7209bc5e3d14029d83e2be24343ae9e8', 'Expirado', '2026-04-04 21:20:34'),
+(37, '2026-04-04 21:59:13', 'Telefono', '015027|4445cf22529bef8444609d9d69f27afe', 'Pendiente', '2026-04-04 22:09:13'),
+(38, '2026-04-05 18:52:35', 'Email', '334835|1cf535eda688ae39cc6111865854f0e9', 'Expirado', '2026-04-05 19:02:35'),
+(39, '2026-04-05 19:15:01', 'Email', '340346|65bc9afb427b9ae01862324655a24a74', 'Expirado', '2026-04-05 19:25:01'),
+(40, '2026-04-05 19:16:16', 'Email', '726034|438ec75ffdc17f243298381468136937', 'Expirado', '2026-04-05 19:26:16'),
+(41, '2026-04-05 19:17:06', 'Email', '367962|a5ff6431b342b8d20fed629b273f115f', 'Expirado', '2026-04-05 19:27:06'),
+(42, '2026-04-05 19:33:49', 'Email', '574576|435c69ed68c3a78326316c9b10be91ab', 'Expirado', '2026-04-05 19:43:49'),
+(43, '2026-04-05 19:34:13', 'Email', '035010|fbda6bb382b5631151c049c3ecb425f0', 'Expirado', '2026-04-05 19:44:13'),
+(44, '2026-04-05 19:40:41', 'Email', '253223|0b959b5e37d790feb87cd9d473ebff3e', 'Pendiente', '2026-04-05 19:50:41'),
+(45, '2026-04-05 19:49:25', 'Email', '453233|49c893a49f0eddae581eb7870937ca20', 'Expirado', '2026-04-05 19:59:25'),
+(46, '2026-04-05 19:50:06', 'Email', '436272|0e63eb423432c04bc3e361f6e5b55a99', 'Expirado', '2026-04-05 20:00:06'),
+(47, '2026-04-05 19:50:30', 'Email', '210077|bcd3effed40bc0cbfa71ae0d2f2368ed', 'Expirado', '2026-04-05 20:00:30'),
+(48, '2026-04-05 19:55:23', 'Email', '695588|2082d4d50d98d3f9eb05f6a3ce4d2550', 'Expirado', '2026-04-05 20:05:23'),
+(49, '2026-04-05 19:56:18', 'Email', '502005|f21a9bb053f8b5f5d61f49e5ac2830f9', 'Expirado', '2026-04-05 20:06:18'),
+(50, '2026-04-05 19:58:01', 'Email', '147869|66b33740ad3c5b4ae112807050090de0', 'Expirado', '2026-04-05 20:08:01'),
+(51, '2026-04-05 20:21:13', 'Email', '191005|20a9ba8c97aa6702b7d18ace8611cdf7', 'Expirado', '2026-04-05 20:31:13'),
+(52, '2026-04-05 20:27:03', 'Email', '134377|65f36dddb2a0ef79ae0d7f35ac62270c', 'Expirado', '2026-04-05 20:37:03'),
+(53, '2026-04-05 20:30:13', 'Email', '407052|e5a856129deead11a62ebf851d9571e5', 'Expirado', '2026-04-05 20:40:13'),
+(54, '2026-04-05 20:30:34', 'Email', '835813|55916a3b7197198b89e2ab3a7876cf85', 'Expirado', '2026-04-05 20:40:34'),
+(55, '2026-04-05 20:34:49', 'Email', '770295|82d7adf47b7ad92a7a7140ff1213e38c', 'Expirado', '2026-04-05 20:44:49'),
+(56, '2026-04-05 20:48:58', 'Email', '489159|1e519fb6be989ffce4e7b8ca67d49d5a', 'Expirado', '2026-04-05 20:58:58'),
+(57, '2026-04-05 21:01:17', 'Email', '091601|0d52592898f86a15daa9a30b5b606e9b', 'Expirado', '2026-04-05 21:11:17'),
+(58, '2026-04-05 21:11:29', 'Email', '644959|a434bb87657fead274decc71622e0669', 'Expirado', '2026-04-05 21:21:29'),
+(59, '2026-04-05 22:12:57', 'Email', '559860|37502124ccffad164cdbe0d2e53dd918', 'Expirado', '2026-04-05 22:22:57'),
+(60, '2026-04-05 22:14:19', 'Email', '207105|472abe87ce29474c6a5cb4f8d098b8f3', 'Expirado', '2026-04-05 22:24:19'),
+(61, '2026-04-05 22:16:01', 'Email', '206163|d35f8263bab60f68ea8f3ad8548cf04a', 'Expirado', '2026-04-05 22:26:01'),
+(62, '2026-04-05 22:17:49', 'Email', '356997|7a309934379dda9edaea9fe29037b546', 'Verificado', '2026-04-05 22:27:00'),
+(63, '2026-04-05 22:26:12', 'Email', '226556|3eaa2d1bbc8dc43ff07bbddf5a9e83cf', 'Verificado', '2026-04-05 22:35:45'),
+(64, '2026-04-05 22:46:10', 'Email', '759935|acc0b8a1c9f482db54272ca95a9d56ef', 'Verificado', '2026-04-05 22:55:26'),
+(65, '2026-04-05 22:56:21', 'Email', '498860|14b4f78b4da6aeef4eeceb94c1580364', 'Verificado', '2026-04-05 23:05:44'),
+(66, '2026-04-05 22:58:01', 'Email', '953966|eac320d1382a019de5c5065fc962cc21', 'Verificado', '2026-04-05 23:07:14'),
+(67, '2026-04-06 18:25:03', 'Email', '788833|9456c2a7c598cf03b154008240485ad0', 'Expirado', '2026-04-06 18:35:03'),
+(68, '2026-04-06 18:43:44', 'Email', '856690|0d8a8ed09b6c48ac3ec4f620b40e20ed', 'Expirado', '2026-04-06 18:53:44'),
+(69, '2026-04-06 18:43:53', 'Email', '177607|741910e11dfd1595ecd7d9b410995ff5', 'Pendiente', '2026-04-06 18:53:53');
 
 -- --------------------------------------------------------
 
@@ -4755,7 +5306,7 @@ ALTER TABLE `asistencias`
 -- AUTO_INCREMENT de la tabla `auditoria`
 --
 ALTER TABLE `auditoria`
-  MODIFY `id` bigint(20) NOT NULL AUTO_INCREMENT, AUTO_INCREMENT=24;
+  MODIFY `id` bigint(20) NOT NULL AUTO_INCREMENT, AUTO_INCREMENT=26;
 
 --
 -- AUTO_INCREMENT de la tabla `auditoria_calificaciones`
@@ -4773,13 +5324,13 @@ ALTER TABLE `auditoria_pagos`
 -- AUTO_INCREMENT de la tabla `auditoria_personas`
 --
 ALTER TABLE `auditoria_personas`
-  MODIFY `id` bigint(20) NOT NULL AUTO_INCREMENT, AUTO_INCREMENT=13;
+  MODIFY `id` bigint(20) NOT NULL AUTO_INCREMENT, AUTO_INCREMENT=15;
 
 --
 -- AUTO_INCREMENT de la tabla `auditoria_usuarios`
 --
 ALTER TABLE `auditoria_usuarios`
-  MODIFY `id` bigint(20) NOT NULL AUTO_INCREMENT;
+  MODIFY `id` bigint(20) NOT NULL AUTO_INCREMENT, AUTO_INCREMENT=66;
 
 --
 -- AUTO_INCREMENT de la tabla `calificaciones`
@@ -4929,7 +5480,7 @@ ALTER TABLE `users`
 -- AUTO_INCREMENT de la tabla `verificacion`
 --
 ALTER TABLE `verificacion`
-  MODIFY `id` bigint(20) NOT NULL AUTO_INCREMENT, AUTO_INCREMENT=33;
+  MODIFY `id` bigint(20) NOT NULL AUTO_INCREMENT, AUTO_INCREMENT=70;
 
 --
 -- Restricciones para tablas volcadas
