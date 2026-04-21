@@ -3,7 +3,7 @@
 -- https://www.phpmyadmin.net/
 --
 -- Servidor: 127.0.0.1
--- Tiempo de generación: 06-04-2026 a las 21:52:31
+-- Tiempo de generación: 21-04-2026 a las 21:55:24
 -- Versión del servidor: 10.4.32-MariaDB
 -- Versión de PHP: 8.1.25
 
@@ -188,6 +188,91 @@ CREATE DEFINER=`root`@`localhost` PROCEDURE `sp_actualizar_estado_anotacion` (IN
         ' actualizada a "', p_nuevo_estado, '" para: ', p_nombre_completo_est, '.'
     );
 
+END proc$$
+
+CREATE DEFINER=`` PROCEDURE `sp_actualizar_estado_buena_conducta` (IN `p_id_reporte` BIGINT, IN `p_nuevo_estado` VARCHAR(50), IN `p_seguimiento` TEXT, IN `p_usuario` BIGINT, OUT `p_mensaje` VARCHAR(500))   proc: BEGIN
+
+    DECLARE v_estado_anterior VARCHAR(50);
+
+    DECLARE EXIT HANDLER FOR SQLEXCEPTION
+    BEGIN
+        ROLLBACK;
+        SET p_mensaje = 'Error: No se pudo actualizar el reconocimiento.';
+    END;
+
+    START TRANSACTION;
+
+    SELECT Estado INTO v_estado_anterior
+    FROM reportes_buena_conducta WHERE id = p_id_reporte;
+
+    IF v_estado_anterior IS NULL THEN
+        ROLLBACK;
+        SET p_mensaje = 'Error: Reporte de buena conducta no encontrado.';
+        LEAVE proc;
+    END IF;
+
+    UPDATE reportes_buena_conducta
+    SET Estado     = p_nuevo_estado,
+        Seguimiento = CASE
+            WHEN p_seguimiento IS NOT NULL AND TRIM(p_seguimiento) != ''
+            THEN CONCAT(IFNULL(Seguimiento, ''), ' | ', NOW(), ': ', TRIM(p_seguimiento))
+            ELSE Seguimiento
+        END
+    WHERE id = p_id_reporte;
+
+    INSERT INTO auditoria (ID_User, Accion, Tabla_afectada, ID_Registro_afectado, Datos_anteriores, Datos_nuevos)
+    VALUES (
+        p_usuario, 'UPDATE', 'reportes_buena_conducta', p_id_reporte,
+        JSON_OBJECT('estado', v_estado_anterior),
+        JSON_OBJECT('estado_nuevo', p_nuevo_estado, 'seguimiento', p_seguimiento, 'fecha', NOW())
+    );
+
+    COMMIT;
+
+    SET p_mensaje = CONCAT('Reconocimiento #', p_id_reporte,
+                           ' actualizado a "', p_nuevo_estado, '".');
+END proc$$
+
+CREATE DEFINER=`` PROCEDURE `sp_actualizar_estado_curso` (IN `p_id_curso` BIGINT, IN `p_nuevo_estado` VARCHAR(50), IN `p_observaciones` TEXT, IN `p_usuario` BIGINT, OUT `p_mensaje` VARCHAR(500))   proc: BEGIN
+
+    DECLARE v_estado_actual VARCHAR(50);
+
+    DECLARE EXIT HANDLER FOR SQLEXCEPTION
+    BEGIN
+        ROLLBACK;
+        SET p_mensaje = 'Error: No se pudo actualizar el estado del curso.';
+    END;
+
+    START TRANSACTION;
+
+    SELECT Estado INTO v_estado_actual FROM cursos WHERE id = p_id_curso;
+
+    IF v_estado_actual IS NULL THEN
+        ROLLBACK;
+        SET p_mensaje = 'Error: Curso no encontrado.';
+        LEAVE proc;
+    END IF;
+
+    UPDATE cursos
+    SET Estado       = p_nuevo_estado,
+        Observaciones = CASE
+            WHEN p_observaciones IS NOT NULL AND TRIM(p_observaciones) != ''
+            THEN CONCAT(IFNULL(Observaciones, ''), ' | ', NOW(), ': ', TRIM(p_observaciones))
+            ELSE Observaciones
+        END,
+        Registrado_por = p_usuario
+    WHERE id = p_id_curso;
+
+    INSERT INTO auditoria (ID_User, Accion, Tabla_afectada, ID_Registro_afectado, Datos_anteriores, Datos_nuevos)
+    VALUES (
+        p_usuario, 'UPDATE', 'cursos', p_id_curso,
+        JSON_OBJECT('estado', v_estado_actual),
+        JSON_OBJECT('estado', p_nuevo_estado, 'observaciones', p_observaciones)
+    );
+
+    COMMIT;
+
+    SET p_mensaje = CONCAT('Curso #', p_id_curso, ' actualizado a estado "', p_nuevo_estado, '".');
 END proc$$
 
 CREATE DEFINER=`root`@`localhost` PROCEDURE `sp_admin_cardex_estudiante` (IN `p_id_estudiante` BIGINT, IN `p_id_anio_academico` BIGINT)   BEGIN
@@ -1126,6 +1211,49 @@ CREATE DEFINER=`root`@`localhost` PROCEDURE `sp_admin_resumen_movimientos` (IN `
       AND m.Estado_matricula IN ('Retirada','Trasladada')
     ORDER BY m.Actualizado_en DESC;
 
+END$$
+
+CREATE DEFINER=`` PROCEDURE `sp_cursos_por_docente` (IN `p_id_docente` BIGINT, IN `p_id_anio_academico` BIGINT, IN `p_id_periodo` BIGINT)   BEGIN
+
+    DECLARE v_id_anio BIGINT;
+
+    IF p_id_anio_academico IS NULL THEN
+        SELECT id INTO v_id_anio FROM anio_academico WHERE Es_actual = 1 LIMIT 1;
+    ELSE
+        SET v_id_anio = p_id_anio_academico;
+    END IF;
+
+    SELECT
+        c.id                                          AS ID_Curso,
+        c.Titulo,
+        c.Tema,
+        mat.Nombre_de_la_materia                      AS Materia,
+        g.Nombre                                      AS Grado,
+        g.Paralelo,
+        per.Nombre_periodo                            AS Periodo,
+        c.Fecha_programada,
+        c.Hora_inicio,
+        c.Hora_fin,
+        c.Aula,
+        c.Tipo,
+        c.Modalidad,
+        c.Estado,
+        (SELECT COUNT(*) FROM asistencia_curso ac
+         WHERE ac.ID_Curso = c.id
+           AND ac.Estado   = 'Presente')              AS Estudiantes_Presentes,
+        (SELECT COUNT(*) FROM asistencia_curso ac2
+         WHERE ac2.ID_Curso = c.id)                  AS Total_Registros_Asistencia,
+        c.Observaciones,
+        c.Creado_en
+    FROM cursos c
+    JOIN asignacion_docente ad ON c.ID_Asignacion     = ad.id
+    JOIN materias           mat ON ad.ID_Materia       = mat.id
+    JOIN grado              g   ON ad.ID_Grado         = g.id
+    JOIN periodo            per ON c.ID_Periodo        = per.id
+    WHERE ad.ID_Docente          = p_id_docente
+      AND c.ID_Anio_Academico    = v_id_anio
+      AND (p_id_periodo IS NULL OR c.ID_Periodo = p_id_periodo)
+    ORDER BY c.Fecha_programada DESC, c.Hora_inicio;
 END$$
 
 CREATE DEFINER=`root`@`localhost` PROCEDURE `sp_eliminar_administrativo_por_nombre` (IN `p_nombre` VARCHAR(255), IN `p_apellido` VARCHAR(255), IN `p_motivo` TEXT, IN `p_usuario_elimina` BIGINT, OUT `p_eliminados` INT, OUT `p_mensaje` VARCHAR(500))   BEGIN
@@ -2416,6 +2544,204 @@ CREATE DEFINER=`root`@`localhost` PROCEDURE `sp_registrar_anotacion_estudiante` 
 
 END proc$$
 
+CREATE DEFINER=`` PROCEDURE `sp_registrar_buena_conducta` (IN `p_nombre_estudiante` VARCHAR(255), IN `p_apellido_estudiante` VARCHAR(255), IN `p_nombre_reporta` VARCHAR(255), IN `p_apellido_reporta` VARCHAR(255), IN `p_fecha_conducta` DATE, IN `p_tipo_reconocimiento` VARCHAR(100), IN `p_categoria` VARCHAR(100), IN `p_descripcion` TEXT, IN `p_acciones_tomadas` TEXT, IN `p_fecha_accion` DATE, IN `p_notificado_padres` TINYINT(1), IN `p_fecha_notificacion` DATE, IN `p_puntos` INT, IN `p_seguimiento` TEXT, OUT `p_id_reporte` BIGINT, OUT `p_codigo_estudiante` VARCHAR(50), OUT `p_nombre_completo_est` VARCHAR(511), OUT `p_nombre_completo_rep` VARCHAR(511), OUT `p_mensaje` VARCHAR(500))   proc: BEGIN
+
+    DECLARE v_id_estudiante   BIGINT;
+    DECLARE v_id_user_reporta BIGINT;
+    DECLARE v_count_est       INT DEFAULT 0;
+    DECLARE v_count_rep       INT DEFAULT 0;
+
+    DECLARE EXIT HANDLER FOR SQLEXCEPTION
+    BEGIN
+        ROLLBACK;
+        SET p_id_reporte          = NULL;
+        SET p_codigo_estudiante   = NULL;
+        SET p_nombre_completo_est = NULL;
+        SET p_nombre_completo_rep = NULL;
+        SET p_mensaje = 'Error: No se pudo registrar el reconocimiento de conducta.';
+    END;
+
+    START TRANSACTION;
+
+    -- Validaciones básicas
+    IF p_nombre_estudiante IS NULL OR TRIM(p_nombre_estudiante) = '' OR
+       p_apellido_estudiante IS NULL OR TRIM(p_apellido_estudiante) = '' THEN
+        ROLLBACK;
+        SET p_mensaje = 'Error: Nombre y apellido del estudiante son obligatorios.';
+        LEAVE proc;
+    END IF;
+
+    IF p_descripcion IS NULL OR TRIM(p_descripcion) = '' THEN
+        ROLLBACK;
+        SET p_mensaje = 'Error: La descripción del reconocimiento es obligatoria.';
+        LEAVE proc;
+    END IF;
+
+    -- Buscar estudiante
+    SELECT COUNT(*) INTO v_count_est
+    FROM estudiante e
+    INNER JOIN users u   ON e.ID_User    = u.id
+    INNER JOIN persona p ON u.ID_Persona = p.id
+    WHERE p.Nombre   LIKE CONCAT('%', TRIM(p_nombre_estudiante),   '%')
+      AND p.Apellido LIKE CONCAT('%', TRIM(p_apellido_estudiante), '%')
+      AND e.Estado = 'Activo';
+
+    IF v_count_est = 0 THEN
+        ROLLBACK;
+        SET p_mensaje = CONCAT('Error: No se encontró estudiante activo con el nombre "',
+                               p_nombre_estudiante, ' ', p_apellido_estudiante, '".');
+        LEAVE proc;
+    END IF;
+
+    IF v_count_est > 1 THEN
+        ROLLBACK;
+        SET p_mensaje = CONCAT('Error: Se encontraron ', v_count_est,
+                               ' estudiantes. Use un nombre más específico.');
+        LEAVE proc;
+    END IF;
+
+    SELECT e.id, e.Codigo_estudiante, CONCAT(p.Nombre, ' ', p.Apellido)
+    INTO   v_id_estudiante, p_codigo_estudiante, p_nombre_completo_est
+    FROM estudiante e
+    INNER JOIN users u   ON e.ID_User    = u.id
+    INNER JOIN persona p ON u.ID_Persona = p.id
+    WHERE p.Nombre   LIKE CONCAT('%', TRIM(p_nombre_estudiante),   '%')
+      AND p.Apellido LIKE CONCAT('%', TRIM(p_apellido_estudiante), '%')
+      AND e.Estado = 'Activo'
+    LIMIT 1;
+
+    -- Buscar usuario que reporta (docente o admin)
+    SELECT COUNT(*) INTO v_count_rep
+    FROM users u
+    INNER JOIN persona p ON u.ID_Persona = p.id
+    WHERE p.Nombre   LIKE CONCAT('%', TRIM(p_nombre_reporta),   '%')
+      AND p.Apellido LIKE CONCAT('%', TRIM(p_apellido_reporta), '%')
+      AND u.Estado = 'Activo'
+      AND u.ID_Rol IN (
+          SELECT id FROM roles
+          WHERE Nombre IN ('Docente','Administrador','Director','Secretaria')
+      );
+
+    IF v_count_rep = 0 THEN
+        ROLLBACK;
+        SET p_mensaje = CONCAT('Error: No se encontró docente/admin activo con el nombre "',
+                               p_nombre_reporta, ' ', p_apellido_reporta, '".');
+        LEAVE proc;
+    END IF;
+
+    IF v_count_rep > 1 THEN
+        ROLLBACK;
+        SET p_mensaje = CONCAT('Error: Se encontraron ', v_count_rep,
+                               ' usuarios. Use un nombre más específico.');
+        LEAVE proc;
+    END IF;
+
+    SELECT u.id, CONCAT(p.Nombre, ' ', p.Apellido)
+    INTO   v_id_user_reporta, p_nombre_completo_rep
+    FROM users u
+    INNER JOIN persona p ON u.ID_Persona = p.id
+    WHERE p.Nombre   LIKE CONCAT('%', TRIM(p_nombre_reporta),   '%')
+      AND p.Apellido LIKE CONCAT('%', TRIM(p_apellido_reporta), '%')
+      AND u.Estado = 'Activo'
+      AND u.ID_Rol IN (
+          SELECT id FROM roles
+          WHERE Nombre IN ('Docente','Administrador','Director','Secretaria')
+      )
+    LIMIT 1;
+
+    -- Insertar reconocimiento
+    INSERT INTO reportes_buena_conducta (
+        ID_Estudiante, ID_Reportado_por, Fecha_conducta,
+        Tipo_reconocimiento, Categoria, Descripcion,
+        Acciones_tomadas, Fecha_accion,
+        Notificado_padres, Fecha_notificacion,
+        Estado, Puntos, Seguimiento
+    ) VALUES (
+        v_id_estudiante, v_id_user_reporta,
+        IFNULL(p_fecha_conducta, CURDATE()),
+        p_tipo_reconocimiento, p_categoria, p_descripcion,
+        p_acciones_tomadas, p_fecha_accion,
+        IFNULL(p_notificado_padres, 0), p_fecha_notificacion,
+        'Registrado', IFNULL(p_puntos, 0), p_seguimiento
+    );
+
+    SET p_id_reporte = LAST_INSERT_ID();
+
+    COMMIT;
+
+    SET p_mensaje = CONCAT(
+        'Reconocimiento registrado. Reporte #', p_id_reporte,
+        ' | Estudiante: ', p_nombre_completo_est, ' (', p_codigo_estudiante, ')',
+        ' | Tipo: ', p_tipo_reconocimiento,
+        ' | Registrado por: ', p_nombre_completo_rep
+    );
+END proc$$
+
+CREATE DEFINER=`` PROCEDURE `sp_registrar_curso` (IN `p_id_asignacion` BIGINT, IN `p_id_periodo` BIGINT, IN `p_titulo` VARCHAR(255), IN `p_descripcion` TEXT, IN `p_tema` VARCHAR(255), IN `p_fecha_programada` DATE, IN `p_hora_inicio` TIME, IN `p_hora_fin` TIME, IN `p_aula` VARCHAR(100), IN `p_tipo` VARCHAR(50), IN `p_modalidad` VARCHAR(50), IN `p_recursos` TEXT, IN `p_objetivos` TEXT, IN `p_observaciones` TEXT, IN `p_registrado_por` BIGINT, OUT `p_id_curso` BIGINT, OUT `p_mensaje` VARCHAR(500))   proc: BEGIN
+
+    DECLARE v_id_anio    BIGINT;
+    DECLARE v_count_asig INT DEFAULT 0;
+
+    DECLARE EXIT HANDLER FOR SQLEXCEPTION
+    BEGIN
+        ROLLBACK;
+        SET p_id_curso = NULL;
+        SET p_mensaje  = 'Error: No se pudo registrar el curso.';
+    END;
+
+    START TRANSACTION;
+
+    -- Validaciones
+    IF p_titulo IS NULL OR TRIM(p_titulo) = '' THEN
+        ROLLBACK;
+        SET p_mensaje = 'Error: El título del curso es obligatorio.';
+        LEAVE proc;
+    END IF;
+
+    SELECT COUNT(*) INTO v_count_asig
+    FROM asignacion_docente
+    WHERE id = p_id_asignacion AND Estado = 'Activo';
+
+    IF v_count_asig = 0 THEN
+        ROLLBACK;
+        SET p_mensaje = 'Error: La asignación docente no existe o no está activa.';
+        LEAVE proc;
+    END IF;
+
+    -- Obtener año académico desde el período
+    SELECT ID_Anio_Academico INTO v_id_anio
+    FROM periodo WHERE id = p_id_periodo LIMIT 1;
+
+    IF v_id_anio IS NULL THEN
+        ROLLBACK;
+        SET p_mensaje = 'Error: El período indicado no existe.';
+        LEAVE proc;
+    END IF;
+
+    INSERT INTO cursos (
+        ID_Asignacion, ID_Periodo, ID_Anio_Academico,
+        Titulo, Descripcion, Tema,
+        Fecha_programada, Hora_inicio, Hora_fin, Aula,
+        Tipo, Modalidad, Recursos, Objetivos, Observaciones,
+        Registrado_por, Estado
+    ) VALUES (
+        p_id_asignacion, p_id_periodo, v_id_anio,
+        TRIM(p_titulo), p_descripcion, p_tema,
+        p_fecha_programada, p_hora_inicio, p_hora_fin, p_aula,
+        IFNULL(p_tipo, 'Teorica'), IFNULL(p_modalidad, 'Presencial'),
+        p_recursos, p_objetivos, p_observaciones,
+        p_registrado_por, 'Programado'
+    );
+
+    SET p_id_curso = LAST_INSERT_ID();
+
+    COMMIT;
+
+    SET p_mensaje = CONCAT('Curso registrado exitosamente. ID: ', p_id_curso,
+                           ' | Título: ', p_titulo,
+                           ' | Fecha: ', IFNULL(DATE_FORMAT(p_fecha_programada, '%d/%m/%Y'), 'Sin fecha'));
+END proc$$
+
 CREATE DEFINER=`root`@`localhost` PROCEDURE `sp_registrar_login` (IN `p_correo` VARCHAR(255), IN `p_password` VARCHAR(255), IN `p_ip` VARCHAR(45), IN `p_user_agent` VARCHAR(255), OUT `p_id_user` BIGINT, OUT `p_id_rol` BIGINT, OUT `p_nombre_completo` VARCHAR(511), OUT `p_mensaje` VARCHAR(500))   BEGIN
     DECLARE v_password_bd VARCHAR(255);
     DECLARE v_estado VARCHAR(50);
@@ -2484,6 +2810,149 @@ CREATE DEFINER=`root`@`localhost` PROCEDURE `sp_registrar_login` (IN `p_correo` 
         SET p_id_user = NULL;
         COMMIT;
     END IF;
+END$$
+
+CREATE DEFINER=`` PROCEDURE `sp_resumen_buena_conducta_grado` (IN `p_fecha_inicio` DATE, IN `p_fecha_fin` DATE)   BEGIN
+
+    DECLARE v_fecha_inicio DATE;
+    DECLARE v_fecha_fin    DATE;
+
+    IF p_fecha_inicio IS NULL THEN
+        SELECT Fecha_inicio INTO v_fecha_inicio
+        FROM anio_academico WHERE Es_actual = 1 LIMIT 1;
+    ELSE
+        SET v_fecha_inicio = p_fecha_inicio;
+    END IF;
+
+    SET v_fecha_fin = IFNULL(p_fecha_fin, CURDATE());
+
+    -- Por tipo de reconocimiento
+    SELECT 'POR_TIPO' AS Seccion;
+    SELECT
+        rbc.Tipo_reconocimiento,
+        COUNT(*)                                               AS Total,
+        ROUND(COUNT(*) * 100.0 / SUM(COUNT(*)) OVER (), 2)   AS Porcentaje
+    FROM reportes_buena_conducta rbc
+    WHERE rbc.Fecha_conducta BETWEEN v_fecha_inicio AND v_fecha_fin
+    GROUP BY rbc.Tipo_reconocimiento
+    ORDER BY Total DESC;
+
+    -- Top 10 estudiantes con más reconocimientos
+    SELECT 'TOP10_ESTUDIANTES' AS Seccion;
+    SELECT
+        e.Codigo_estudiante,
+        CONCAT(p.Nombre, ' ', p.Apellido)                     AS Nombre_Estudiante,
+        g.Nombre                                              AS Grado,
+        COUNT(rbc.id)                                         AS Total_Reconocimientos,
+        IFNULL(SUM(rbc.Puntos), 0)                            AS Total_Puntos
+    FROM reportes_buena_conducta rbc
+    JOIN estudiante  e  ON rbc.ID_Estudiante = e.id
+    JOIN users       u  ON e.ID_User         = u.id
+    JOIN persona     p  ON u.ID_Persona      = p.id
+    LEFT JOIN matricula m ON e.id = m.ID_Estudiante AND m.Estado_matricula = 'Activa'
+    LEFT JOIN grado   g  ON m.ID_Grado       = g.id
+    WHERE rbc.Fecha_conducta BETWEEN v_fecha_inicio AND v_fecha_fin
+    GROUP BY e.id, e.Codigo_estudiante, p.Nombre, p.Apellido, g.Nombre
+    ORDER BY Total_Reconocimientos DESC
+    LIMIT 10;
+
+    -- Por grado
+    SELECT 'POR_GRADO' AS Seccion;
+    SELECT
+        g.Nombre                                              AS Grado,
+        g.Paralelo,
+        COUNT(rbc.id)                                         AS Total_Reconocimientos,
+        IFNULL(SUM(rbc.Puntos), 0)                            AS Total_Puntos
+    FROM reportes_buena_conducta rbc
+    JOIN estudiante  e  ON rbc.ID_Estudiante = e.id
+    LEFT JOIN matricula m ON e.id = m.ID_Estudiante AND m.Estado_matricula = 'Activa'
+    LEFT JOIN grado   g  ON m.ID_Grado       = g.id
+    WHERE rbc.Fecha_conducta BETWEEN v_fecha_inicio AND v_fecha_fin
+    GROUP BY g.id, g.Nombre, g.Paralelo
+    ORDER BY Total_Reconocimientos DESC;
+
+    -- Tendencia mensual
+    SELECT 'TENDENCIA_MENSUAL' AS Seccion;
+    SELECT
+        YEAR(rbc.Fecha_conducta)                              AS Anio,
+        MONTH(rbc.Fecha_conducta)                             AS Mes,
+        MONTHNAME(rbc.Fecha_conducta)                         AS Nombre_Mes,
+        COUNT(*)                                              AS Total
+    FROM reportes_buena_conducta rbc
+    WHERE rbc.Fecha_conducta BETWEEN v_fecha_inicio AND v_fecha_fin
+    GROUP BY YEAR(rbc.Fecha_conducta), MONTH(rbc.Fecha_conducta)
+    ORDER BY Anio, Mes;
+END$$
+
+CREATE DEFINER=`` PROCEDURE `sp_resumen_conducta_estudiante` (IN `p_id_estudiante` BIGINT, IN `p_id_anio_academico` BIGINT)   BEGIN
+
+    DECLARE v_id_anio BIGINT;
+
+    IF p_id_anio_academico IS NULL THEN
+        SELECT id INTO v_id_anio FROM anio_academico WHERE Es_actual = 1 LIMIT 1;
+    ELSE
+        SET v_id_anio = p_id_anio_academico;
+    END IF;
+
+    -- Datos del estudiante
+    SELECT 'DATOS_ESTUDIANTE' AS Seccion;
+    SELECT Codigo_estudiante, Nombre_Completo, Grado_Actual, Paralelo
+    FROM v_datos_completos_estudiante
+    WHERE ID_Estudiante = p_id_estudiante;
+
+    -- Reconocimientos de buena conducta
+    SELECT 'RECONOCIMIENTOS' AS Seccion;
+    SELECT
+        rbc.id                                        AS ID_Reconocimiento,
+        rbc.Fecha_conducta,
+        rbc.Tipo_reconocimiento,
+        rbc.Categoria,
+        rbc.Descripcion,
+        rbc.Acciones_tomadas,
+        rbc.Puntos,
+        rbc.Estado,
+        CONCAT(pr.Nombre, ' ', pr.Apellido)           AS Reconocido_Por,
+        rbc.Notificado_padres,
+        rbc.Seguimiento,
+        rbc.Creado_en
+    FROM reportes_buena_conducta rbc
+    JOIN users   ur ON rbc.ID_Reportado_por = ur.id
+    JOIN persona pr ON ur.ID_Persona        = pr.id
+    WHERE rbc.ID_Estudiante = p_id_estudiante
+    ORDER BY rbc.Fecha_conducta DESC;
+
+    -- Reportes disciplinarios (para comparar)
+    SELECT 'REPORTES_DISCIPLINARIOS' AS Seccion;
+    SELECT
+        rd.id                                        AS ID_Reporte,
+        rd.Fecha_incidente,
+        rd.Tipo_falta,
+        rd.Categoria,
+        rd.Descripcion,
+        rd.Estado
+    FROM reportes_disciplinarios rd
+    WHERE rd.ID_Estudiante = p_id_estudiante
+    ORDER BY rd.Fecha_incidente DESC;
+
+    -- Balance general de conducta
+    SELECT 'BALANCE_CONDUCTA' AS Seccion;
+    SELECT
+        (SELECT COUNT(*) FROM reportes_buena_conducta
+         WHERE ID_Estudiante = p_id_estudiante)                   AS Total_Reconocimientos,
+        (SELECT IFNULL(SUM(Puntos), 0) FROM reportes_buena_conducta
+         WHERE ID_Estudiante = p_id_estudiante)                   AS Total_Puntos_Positivos,
+        (SELECT COUNT(*) FROM reportes_buena_conducta
+         WHERE ID_Estudiante = p_id_estudiante
+           AND Estado IN ('Registrado', 'En_proceso'))            AS Reconocimientos_Activos,
+        (SELECT COUNT(*) FROM reportes_disciplinarios
+         WHERE ID_Estudiante = p_id_estudiante)                   AS Total_Anotaciones,
+        (SELECT COUNT(*) FROM reportes_disciplinarios
+         WHERE ID_Estudiante = p_id_estudiante
+           AND Estado IN ('Abierto', 'En_proceso'))               AS Anotaciones_Activas,
+        (SELECT COUNT(*) FROM reportes_disciplinarios
+         WHERE ID_Estudiante = p_id_estudiante
+           AND Tipo_falta IN ('Grave', 'Muy_grave'))              AS Faltas_Graves;
+
 END$$
 
 CREATE DEFINER=`root`@`localhost` PROCEDURE `sp_verificar_codigo_2fa` (IN `p_id_user` BIGINT, IN `p_id_verificacion` BIGINT, IN `p_codigo` VARCHAR(6), IN `p_ip` VARCHAR(45), OUT `p_verificado` TINYINT(1), OUT `p_mensaje` VARCHAR(500))   proc: BEGIN
@@ -2781,50 +3250,27 @@ INSERT INTO `asistencias` (`id`, `ID_Estudiante`, `ID_Materia`, `ID_Docente`, `F
 -- --------------------------------------------------------
 
 --
+-- Estructura de tabla para la tabla `asistencia_curso`
+--
+
+CREATE TABLE `asistencia_curso` (
+  `id` bigint(20) NOT NULL,
+  `ID_Curso` bigint(20) NOT NULL,
+  `ID_Estudiante` bigint(20) NOT NULL,
+  `Estado` enum('Presente','Ausente','Tardanza','Justificado','Permiso') NOT NULL DEFAULT 'Presente',
+  `Hora_llegada` time DEFAULT NULL,
+  `Observaciones` text DEFAULT NULL,
+  `Registrado_por` bigint(20) DEFAULT NULL,
+  `Creado_en` timestamp NOT NULL DEFAULT current_timestamp()
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_general_ci COMMENT='Asistencia por curso (clase individual)';
+
+-- --------------------------------------------------------
+
+--
 -- Estructura de tabla para la tabla `auditoria`
 --
-
-CREATE TABLE `auditoria` (
-  `id` bigint(20) NOT NULL,
-  `ID_User` bigint(20) NOT NULL,
-  `Accion` varchar(255) NOT NULL COMMENT 'INSERT, UPDATE, DELETE, LOGIN, etc.',
-  `Tabla_afectada` varchar(100) DEFAULT NULL,
-  `ID_Registro_afectado` bigint(20) DEFAULT NULL,
-  `Datos_anteriores` text DEFAULT NULL COMMENT 'JSON con datos antes del cambio',
-  `Datos_nuevos` text DEFAULT NULL COMMENT 'JSON con datos después del cambio',
-  `IP_Address` varchar(45) DEFAULT NULL,
-  `User_Agent` varchar(255) DEFAULT NULL,
-  `Fecha_hora` timestamp NOT NULL DEFAULT current_timestamp()
-) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_general_ci;
-
---
--- Volcado de datos para la tabla `auditoria`
---
-
-INSERT INTO `auditoria` (`id`, `ID_User`, `Accion`, `Tabla_afectada`, `ID_Registro_afectado`, `Datos_anteriores`, `Datos_nuevos`, `IP_Address`, `User_Agent`, `Fecha_hora`) VALUES
-(1, 1, 'LOGIN', NULL, NULL, NULL, NULL, '192.168.1.100', NULL, '2026-02-15 12:00:00'),
-(2, 6, 'INSERT', 'pagos', 1, NULL, '{\"concepto\":\"Matricula\",\"monto\":500.00}', '192.168.1.101', NULL, '2026-01-20 13:30:00'),
-(3, 2, 'UPDATE', 'calificaciones', 1, '{\"nota\":80.00}', '{\"nota\":85.00}', '192.168.1.102', NULL, '2026-02-10 18:30:00'),
-(4, 1, 'INSERT', 'matricula', 1, NULL, '{\"ID_Estudiante\":1,\"ID_Grado\":8}', '192.168.1.100', NULL, '2026-01-20 13:00:00'),
-(6, 23, 'INSERT', 'estudiante', 10, NULL, '{\"id\": 10, \"ID_User\": 23, \"Codigo_estudiante\": \"EST-2026-009\", \"Tipo_sangre\": \"A+\", \"Estado\": \"Activo\"}', NULL, NULL, '2026-03-15 20:30:07'),
-(7, 1, 'INSERT', 'inscripcion', 10, NULL, '{\"id_persona\": \"23\", \"id_user\": \"23\", \"id_estudiante\": \"10\", \"codigo_estudiante\": \"EST-2026-009\", \"id_inscripcion\": \"10\", \"id_matricula\": \"9\", \"numero_matricula\": \"MAT-2026-009\", \"id_grado\": \"9\", \"tipo_inscripcion\": \"Nueva\", \"anio_academico\": \"2026\", \"id_padre1\": \"7\", \"id_padre2\": \"8\", \"registrado_por\": \"1\", \"fecha\": \"2026-03-15 16:30:07\"}', NULL, NULL, '2026-03-15 20:30:07'),
-(8, 2, 'INSERT', 'reportes_disciplinarios', 3, NULL, '{\"id_reporte\": \"3\", \"id_estudiante\": \"3\", \"codigo_estudiante\": \"EST-2026-003\", \"estudiante\": \"Santiago Sánchez\", \"reportado_por\": \"María Rodríguez\", \"tipo_falta\": \"Moderada\", \"categoria\": \"Conducta\", \"fecha_incidente\": \"2026-03-15\", \"fecha_registro\": \"2026-03-15 16:51:26\"}', NULL, NULL, '2026-03-15 20:51:26'),
-(9, 26, 'INSERT', 'estudiante', 11, NULL, '{\"id\": 11, \"ID_User\": 26, \"Codigo_estudiante\": \"EST-2026-010\", \"Tipo_sangre\": \"O+\", \"Estado\": \"Activo\"}', NULL, NULL, '2026-03-15 21:25:59'),
-(10, 1, 'INSERT', 'inscripcion', 11, NULL, '{\"id_persona\": \"26\", \"id_user\": \"26\", \"id_estudiante\": \"11\", \"codigo_estudiante\": \"EST-2026-010\", \"id_inscripcion\": \"11\", \"id_matricula\": \"10\", \"numero_matricula\": \"MAT-2026-010\", \"id_grado\": \"1\", \"tipo_inscripcion\": \"Nueva\", \"anio_academico\": \"2026\", \"id_padre1\": \"9\", \"id_padre2\": null, \"registrado_por\": \"1\", \"fecha\": \"2026-03-15 17:25:59\"}', NULL, NULL, '2026-03-15 21:25:59'),
-(11, 28, 'INSERT', 'estudiante', 12, NULL, '{\"id\": 12, \"ID_User\": 28, \"Codigo_estudiante\": \"EST-2026-011\", \"Tipo_sangre\": \"\", \"Estado\": \"Activo\"}', NULL, NULL, '2026-03-15 22:30:27'),
-(12, 1, 'INSERT', 'inscripcion', 12, NULL, '{\"id_persona\": \"28\", \"id_user\": \"28\", \"id_estudiante\": \"12\", \"codigo_estudiante\": \"EST-2026-011\", \"id_inscripcion\": \"12\", \"id_matricula\": \"11\", \"numero_matricula\": \"MAT-2026-011\", \"id_grado\": \"2\", \"tipo_inscripcion\": \"Nueva\", \"anio_academico\": \"2026\", \"id_padre1\": \"10\", \"id_padre2\": null, \"registrado_por\": \"1\", \"fecha\": \"2026-03-15 18:30:27\"}', NULL, NULL, '2026-03-15 22:30:27'),
-(13, 30, 'INSERT', 'estudiante', 13, NULL, '{\"id\": 13, \"ID_User\": 30, \"Codigo_estudiante\": \"EST-2026-012\", \"Tipo_sangre\": \"O-\", \"Estado\": \"Activo\"}', NULL, NULL, '2026-03-15 22:51:10'),
-(14, 1, 'INSERT', 'inscripcion', 13, NULL, '{\"id_persona\": \"30\", \"id_user\": \"30\", \"id_estudiante\": \"13\", \"codigo_estudiante\": \"EST-2026-012\", \"id_inscripcion\": \"13\", \"id_matricula\": \"12\", \"numero_matricula\": \"MAT-2026-012\", \"id_grado\": \"2\", \"tipo_inscripcion\": \"Reingreso\", \"anio_academico\": \"2026\", \"id_padre1\": \"11\", \"id_padre2\": null, \"registrado_por\": \"1\", \"fecha\": \"2026-03-15 18:51:10\"}', NULL, NULL, '2026-03-15 22:51:10'),
-(15, 1, 'UPDATE', 'reportes_disciplinarios', 3, '{\"estado\": \"Abierto\"}', '{\"id_reporte\": \"3\", \"id_estudiante\": \"3\", \"estudiante\": \"Santiago Sánchez\", \"estado_nuevo\": \"En_proceso\", \"seguimiento\": \"Se citó a los padres para el día 20 de marzo.\", \"fecha\": \"2026-03-16 16:49:04\"}', NULL, NULL, '2026-03-16 20:49:04'),
-(16, 1, 'UPDATE', 'reportes_disciplinarios', 3, '{\"estado\": \"En_proceso\"}', '{\"id_reporte\": \"3\", \"id_estudiante\": \"3\", \"estudiante\": \"Santiago Sánchez\", \"estado_nuevo\": \"En_proceso\", \"seguimiento\": \"Se citó a los padres para el día 20 de marzo.\", \"fecha\": \"2026-03-16 16:49:04\"}', NULL, NULL, '2026-03-16 20:49:04'),
-(17, 1, 'UPDATE', 'reportes_disciplinarios', 3, '{\"estado\": \"En_proceso\"}', '{\"id_reporte\": \"3\", \"id_estudiante\": \"3\", \"estudiante\": \"Santiago Sánchez\", \"fecha_incidente\": \"2026-03-15\", \"estado_nuevo\": \"En_proceso\", \"seguimiento\": \"Se citó a los padres para el día 20 de marzo.\", \"fecha\": \"2026-03-16 16:57:24\"}', NULL, NULL, '2026-03-16 20:57:24'),
-(19, 30, 'UPDATE', 'estudiante', 13, '{\"id\": 13, \"Codigo_estudiante\": \"EST-2026-012\", \"Tipo_sangre\": \"O-\", \"Estado\": \"Activo\"}', '{\"id\": 13, \"Codigo_estudiante\": \"EST-2026-012\", \"Tipo_sangre\": \"O-\", \"Estado\": \"Activo\"}', NULL, NULL, '2026-03-16 21:00:40'),
-(20, 2, 'INSERT', 'reportes_disciplinarios', 4, NULL, '{\"id_reporte\": \"4\", \"id_estudiante\": \"3\", \"codigo_estudiante\": \"EST-2026-003\", \"estudiante\": \"Santiago Sánchez\", \"reportado_por\": \"María Rodríguez\", \"tipo_falta\": \"Moderada\", \"categoria\": \"Conducta\", \"fecha_incidente\": \"2026-03-16\", \"fecha_registro\": \"2026-03-16 17:50:08\"}', NULL, NULL, '2026-03-16 21:50:08'),
-(21, 2, 'INSERT', 'reportes_disciplinarios', 5, NULL, '{\"id_reporte\": \"5\", \"id_estudiante\": \"3\", \"codigo_estudiante\": \"EST-2026-003\", \"estudiante\": \"Santiago Sánchez\", \"reportado_por\": \"María Rodríguez\", \"tipo_falta\": \"Moderada\", \"categoria\": \"Disciplinaria\", \"fecha_incidente\": \"2026-03-12\", \"fecha_registro\": \"2026-03-16 17:59:41\"}', NULL, NULL, '2026-03-16 21:59:41'),
-(22, 32, 'INSERT', 'estudiante', 14, NULL, '{\"id\": 14, \"ID_User\": 32, \"Codigo_estudiante\": \"EST-2026-013\", \"Tipo_sangre\": \"A+\", \"Estado\": \"Activo\"}', NULL, NULL, '2026-03-18 00:11:39'),
-(23, 1, 'INSERT', 'inscripcion', 14, NULL, '{\"id_persona\": \"32\", \"id_user\": \"32\", \"id_estudiante\": \"14\", \"codigo_estudiante\": \"EST-2026-013\", \"id_inscripcion\": \"14\", \"id_matricula\": \"13\", \"numero_matricula\": \"MAT-2026-013\", \"id_grado\": \"3\", \"tipo_inscripcion\": \"Reingreso\", \"anio_academico\": \"2026\", \"id_padre1\": \"12\", \"id_padre2\": null, \"registrado_por\": \"1\", \"fecha\": \"2026-03-17 20:11:39\"}', NULL, NULL, '2026-03-18 00:11:39'),
-(24, 21, 'UPDATE', 'persona', 21, '{\"Nombre\": \"Jaziel\", \"Apellido\": \"Vargas\", \"CI\": \"0288103\", \"Telefono\": \"829092993\", \"Direccion\": \"limanipata\"}', '{\"Nombre\": \"Jaziel\", \"Apellido\": \"Vargas\", \"CI\": \"0288103\", \"Telefono\": \"829092993\", \"Direccion\": \"limanipata\"}', NULL, NULL, '2026-04-04 21:20:45'),
-(25, 21, 'UPDATE', 'persona', 21, '{\"Nombre\": \"Jaziel\", \"Apellido\": \"Vargas\", \"CI\": \"0288103\", \"Telefono\": \"829092993\", \"Direccion\": \"limanipata\"}', '{\"Nombre\": \"Jaziel\", \"Apellido\": \"Vargas\", \"CI\": \"0288103\", \"Telefono\": \"+591 79532646\", \"Direccion\": \"limanipata\"}', NULL, NULL, '2026-04-04 22:05:09');
+-- Error leyendo la estructura de la tabla sge.auditoria: #1932 - Table &#039;sge.auditoria&#039; doesn&#039;t exist in engine
+-- Error leyendo datos de la tabla sge.auditoria: #1064 - Algo está equivocado en su sintax cerca &#039;FROM `sge`.`auditoria`&#039; en la linea 1
 
 -- --------------------------------------------------------
 
@@ -2985,7 +3431,22 @@ INSERT INTO `auditoria_usuarios` (`id`, `ID_User`, `Accion`, `IP_Address`, `User
 (62, 21, 'LOGIN', '::1', NULL, '{\"accion\": \"2FA_CODIGO_GENERADO\", \"metodo\": \"Email\", \"id_verificacion\": \"67\", \"expira_en\": \"2026-04-06 14:35:03\"}', '2026-04-06 18:25:03'),
 (63, 21, 'LOGIN', '::1', 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/146.0.0.0 Safari/537.36 Edg/146.0.0.0', '{\"accion\": \"LOGIN_PASO_1_OK\", \"requiere_2fa\": \"1\", \"rol\": \"Docente\"}', '2026-04-06 18:27:55'),
 (64, 21, 'LOGIN', '::1', NULL, '{\"accion\": \"2FA_CODIGO_GENERADO\", \"metodo\": \"Email\", \"id_verificacion\": \"68\", \"expira_en\": \"2026-04-06 14:53:44\"}', '2026-04-06 18:43:44'),
-(65, 21, 'LOGIN', '::1', NULL, '{\"accion\": \"2FA_CODIGO_GENERADO\", \"metodo\": \"Email\", \"id_verificacion\": \"69\", \"expira_en\": \"2026-04-06 14:53:53\"}', '2026-04-06 18:43:53');
+(65, 21, 'LOGIN', '::1', NULL, '{\"accion\": \"2FA_CODIGO_GENERADO\", \"metodo\": \"Email\", \"id_verificacion\": \"69\", \"expira_en\": \"2026-04-06 14:53:53\"}', '2026-04-06 18:43:53'),
+(66, 21, 'LOGIN', '', '', '{\"accion\": \"LOGIN_PASO_1_OK\", \"requiere_2fa\": \"1\", \"rol\": \"Docente\"}', '2026-04-06 22:58:05'),
+(67, 21, 'LOGIN', '::ffff:127.0.0.1', 'vscode-restclient', '{\"accion\": \"LOGIN_PASO_1_OK\", \"requiere_2fa\": \"1\", \"rol\": \"Docente\"}', '2026-04-21 19:16:13'),
+(68, 21, 'LOGIN', '::1', 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/145.0.0.0 Safari/537.36 OPR/129.0.0.0', '{\"accion\": \"LOGIN_PASO_1_OK\", \"requiere_2fa\": \"1\", \"rol\": \"Docente\"}', '2026-04-21 19:20:19'),
+(69, 21, 'LOGIN', '::1', NULL, '{\"accion\": \"2FA_CODIGO_GENERADO\", \"metodo\": \"Email\", \"id_verificacion\": \"70\", \"expira_en\": \"2026-04-21 15:31:00\"}', '2026-04-21 19:21:00'),
+(70, 21, 'LOGIN', '::1', NULL, '{\"accion\": \"2FA_VERIFICADO\", \"metodo\": \"Email\", \"id_verificacion\": \"70\", \"fecha\": \"2026-04-21 15:21:17\"}', '2026-04-21 19:21:17'),
+(71, 21, 'LOGIN', '::1', 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/145.0.0.0 Safari/537.36 OPR/129.0.0.0', '{\"accion\": \"LOGIN_PASO_1_OK\", \"requiere_2fa\": \"1\", \"rol\": \"Admin\"}', '2026-04-21 19:24:21'),
+(72, 21, 'LOGIN', '::1', NULL, '{\"accion\": \"2FA_CODIGO_GENERADO\", \"metodo\": \"Email\", \"id_verificacion\": \"71\", \"expira_en\": \"2026-04-21 15:34:22\"}', '2026-04-21 19:24:22'),
+(73, 21, 'LOGIN', '::1', NULL, '{\"accion\": \"2FA_VERIFICADO\", \"metodo\": \"Email\", \"id_verificacion\": \"71\", \"fecha\": \"2026-04-21 15:24:37\"}', '2026-04-21 19:24:37'),
+(74, 21, 'LOGIN', '::ffff:127.0.0.1', 'vscode-restclient', '{\"accion\": \"LOGIN_PASO_1_OK\", \"requiere_2fa\": \"1\", \"rol\": \"Admin\"}', '2026-04-21 19:25:27'),
+(75, 21, 'LOGIN', '::1', 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/145.0.0.0 Safari/537.36 OPR/129.0.0.0', '{\"accion\": \"LOGIN_PASO_1_OK\", \"requiere_2fa\": \"1\", \"rol\": \"Admin\"}', '2026-04-21 19:28:21'),
+(76, 21, 'LOGIN', '::1', NULL, '{\"accion\": \"2FA_CODIGO_GENERADO\", \"metodo\": \"Email\", \"id_verificacion\": \"72\", \"expira_en\": \"2026-04-21 15:39:23\"}', '2026-04-21 19:29:23'),
+(77, 21, 'LOGIN', '::1', NULL, '{\"accion\": \"2FA_VERIFICADO\", \"metodo\": \"Email\", \"id_verificacion\": \"72\", \"fecha\": \"2026-04-21 15:29:46\"}', '2026-04-21 19:29:46'),
+(78, 21, 'LOGIN', '::1', 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/145.0.0.0 Safari/537.36 OPR/129.0.0.0', '{\"accion\": \"LOGIN_PASO_1_OK\", \"requiere_2fa\": \"1\", \"rol\": \"Admin\"}', '2026-04-21 19:52:09'),
+(79, 21, 'LOGIN', '::1', NULL, '{\"accion\": \"2FA_CODIGO_GENERADO\", \"metodo\": \"Email\", \"id_verificacion\": \"73\", \"expira_en\": \"2026-04-21 16:02:10\"}', '2026-04-21 19:52:10'),
+(80, 21, 'LOGIN', '::1', NULL, '{\"accion\": \"2FA_VERIFICADO\", \"metodo\": \"Email\", \"id_verificacion\": \"73\", \"fecha\": \"2026-04-21 15:52:33\"}', '2026-04-21 19:52:33');
 
 -- --------------------------------------------------------
 
@@ -3179,6 +3640,100 @@ INSERT INTO `comunicados` (`id`, `Titulo`, `Contenido`, `Tipo`, `Destinatario`, 
 (1, 'Inicio del Año Escolar 2026', 'Estimadas familias, les damos la bienvenida al año escolar 2026. Las clases iniciarán el 1 de febrero. Les recordamos revisar la lista de útiles escolares en nuestra página web.', 'General', 'Todos', NULL, '2026-01-15 13:00:00', '2026-02-01', NULL, 1, 'Publicado'),
 (2, 'Reunión de Padres 5to Primaria', 'Se convoca a reunión de padres de familia de 5to de Primaria el día viernes 21 de febrero a las 18:00 hrs. en el Aula 205.', 'Academico', 'Padres', 8, '2026-02-10 14:00:00', '2026-02-21', NULL, 2, 'Publicado'),
 (3, 'Jornada Deportiva', 'El próximo sábado 22 de febrero realizaremos nuestra jornada deportiva anual. La participación es obligatoria. Horario: 8:00 - 12:00.', 'Evento', 'Estudiantes', NULL, '2026-02-12 15:00:00', '2026-02-22', NULL, 1, 'Publicado');
+
+-- --------------------------------------------------------
+
+--
+-- Estructura de tabla para la tabla `cursos`
+--
+
+CREATE TABLE `cursos` (
+  `id` bigint(20) NOT NULL,
+  `ID_Asignacion` bigint(20) NOT NULL COMMENT 'FK a asignacion_docente',
+  `ID_Periodo` bigint(20) NOT NULL COMMENT 'FK a periodo',
+  `ID_Anio_Academico` bigint(20) NOT NULL COMMENT 'FK a anio_academico',
+  `Titulo` varchar(255) NOT NULL COMMENT 'Nombre o título de la clase/unidad',
+  `Descripcion` text DEFAULT NULL,
+  `Tema` varchar(255) DEFAULT NULL COMMENT 'Tema principal de la clase',
+  `Fecha_programada` date DEFAULT NULL,
+  `Hora_inicio` time DEFAULT NULL,
+  `Hora_fin` time DEFAULT NULL,
+  `Aula` varchar(100) DEFAULT NULL,
+  `Tipo` enum('Teorica','Practica','Laboratorio','Evaluacion','Taller','Visita','Otro') NOT NULL DEFAULT 'Teorica',
+  `Estado` enum('Programado','En_curso','Realizado','Cancelado','Postergado') NOT NULL DEFAULT 'Programado',
+  `Modalidad` enum('Presencial','Virtual','Hibrido') NOT NULL DEFAULT 'Presencial',
+  `Recursos` text DEFAULT NULL COMMENT 'Materiales o recursos necesarios',
+  `Objetivos` text DEFAULT NULL,
+  `Observaciones` text DEFAULT NULL,
+  `Registrado_por` bigint(20) DEFAULT NULL COMMENT 'FK a users',
+  `Creado_en` timestamp NOT NULL DEFAULT current_timestamp(),
+  `Actualizado_en` timestamp NOT NULL DEFAULT current_timestamp() ON UPDATE current_timestamp()
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_general_ci COMMENT='Clases/unidades programadas por asignación docente';
+
+--
+-- Volcado de datos para la tabla `cursos`
+--
+
+INSERT INTO `cursos` (`id`, `ID_Asignacion`, `ID_Periodo`, `ID_Anio_Academico`, `Titulo`, `Descripcion`, `Tema`, `Fecha_programada`, `Hora_inicio`, `Hora_fin`, `Aula`, `Tipo`, `Estado`, `Modalidad`, `Recursos`, `Objetivos`, `Observaciones`, `Registrado_por`, `Creado_en`, `Actualizado_en`) VALUES
+(1, 1, 1, 1, 'Introducción a Álgebra', 'Primera clase del trimestre: repaso de operaciones básicas y conceptos algebraicos', 'Álgebra elemental', '2026-02-03', '08:00:00', '09:00:00', 'Edificio B - Aula 205', 'Teorica', 'Realizado', 'Presencial', NULL, 'Que el estudiante reconozca y aplique operaciones algebraicas básicas.', NULL, 2, '2026-04-08 21:27:28', '2026-04-08 21:27:28'),
+(2, 1, 1, 1, 'Ecuaciones de primer grado', 'Resolución de ecuaciones lineales con una incógnita', 'Ecuaciones lineales', '2026-02-10', '08:00:00', '09:00:00', 'Edificio B - Aula 205', 'Practica', 'Realizado', 'Presencial', NULL, 'Resolver ecuaciones de primer grado aplicando propiedades de igualdad.', NULL, 2, '2026-04-08 21:27:28', '2026-04-08 21:27:28'),
+(3, 4, 1, 1, 'Lenguaje: Estructura del texto', 'Comprensión lectora y análisis textual', 'Tipos de texto y estructura', '2026-02-03', '08:00:00', '09:00:00', 'Edificio B - Aula 205', 'Teorica', 'Realizado', 'Presencial', NULL, 'Identificar la estructura de diferentes tipos de texto.', NULL, 3, '2026-04-08 21:27:28', '2026-04-08 21:27:28');
+
+--
+-- Disparadores `cursos`
+--
+DELIMITER $$
+CREATE TRIGGER `tr_cursos_delete` BEFORE DELETE ON `cursos` FOR EACH ROW BEGIN
+    INSERT INTO auditoria (ID_User, Accion, Tabla_afectada, ID_Registro_afectado, Datos_anteriores)
+    VALUES (
+        IFNULL(OLD.Registrado_por, 0),
+        'DELETE',
+        'cursos',
+        OLD.id,
+        JSON_OBJECT(
+            'id',      OLD.id,
+            'Titulo',  OLD.Titulo,
+            'Estado',  OLD.Estado,
+            'Fecha',   OLD.Fecha_programada
+        )
+    );
+END
+$$
+DELIMITER ;
+DELIMITER $$
+CREATE TRIGGER `tr_cursos_insert` AFTER INSERT ON `cursos` FOR EACH ROW BEGIN
+    INSERT INTO auditoria (ID_User, Accion, Tabla_afectada, ID_Registro_afectado, Datos_nuevos)
+    VALUES (
+        IFNULL(NEW.Registrado_por, 0),
+        'INSERT',
+        'cursos',
+        NEW.id,
+        JSON_OBJECT(
+            'id',            NEW.id,
+            'ID_Asignacion', NEW.ID_Asignacion,
+            'Titulo',        NEW.Titulo,
+            'Fecha',         NEW.Fecha_programada,
+            'Tipo',          NEW.Tipo,
+            'Estado',        NEW.Estado
+        )
+    );
+END
+$$
+DELIMITER ;
+DELIMITER $$
+CREATE TRIGGER `tr_cursos_update` AFTER UPDATE ON `cursos` FOR EACH ROW BEGIN
+    INSERT INTO auditoria (ID_User, Accion, Tabla_afectada, ID_Registro_afectado, Datos_anteriores, Datos_nuevos)
+    VALUES (
+        IFNULL(NEW.Registrado_por, 0),
+        'UPDATE',
+        'cursos',
+        NEW.id,
+        JSON_OBJECT('Estado', OLD.Estado, 'Titulo', OLD.Titulo, 'Fecha', OLD.Fecha_programada),
+        JSON_OBJECT('Estado', NEW.Estado, 'Titulo', NEW.Titulo, 'Fecha', NEW.Fecha_programada)
+    );
+END
+$$
+DELIMITER ;
 
 -- --------------------------------------------------------
 
@@ -4087,6 +4642,77 @@ INSERT INTO `plantel_administrativo` (`id`, `ID_User`, `Cargo`, `Departamento`, 
 -- --------------------------------------------------------
 
 --
+-- Estructura de tabla para la tabla `reportes_buena_conducta`
+--
+
+CREATE TABLE `reportes_buena_conducta` (
+  `id` bigint(20) NOT NULL,
+  `ID_Estudiante` bigint(20) NOT NULL,
+  `ID_Reportado_por` bigint(20) NOT NULL COMMENT 'Docente o admin que otorga el reconocimiento',
+  `Fecha_conducta` date NOT NULL,
+  `Tipo_reconocimiento` enum('Felicitacion','Mencion_honor','Premio_academico','Premio_deportivo','Premio_artistico','Reconocimiento_conducta','Liderazgo','Solidaridad','Participacion_destacada','Otro') NOT NULL DEFAULT 'Felicitacion',
+  `Categoria` varchar(100) DEFAULT NULL COMMENT 'Ej: Académico, Deportivo, Artístico, Comunitario',
+  `Descripcion` text NOT NULL COMMENT 'Descripción del comportamiento o logro',
+  `Acciones_tomadas` text DEFAULT NULL COMMENT 'Certificado, diploma, mención en acto, etc.',
+  `Fecha_accion` date DEFAULT NULL,
+  `Notificado_padres` tinyint(1) NOT NULL DEFAULT 0,
+  `Fecha_notificacion` date DEFAULT NULL,
+  `Estado` enum('Registrado','En_proceso','Reconocido','Archivado') NOT NULL DEFAULT 'Registrado',
+  `Seguimiento` text DEFAULT NULL,
+  `Puntos` int(11) DEFAULT 0 COMMENT 'Sistema de puntos de conducta (opcional)',
+  `Creado_en` timestamp NOT NULL DEFAULT current_timestamp()
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_general_ci COMMENT='Reconocimientos y reportes de buena conducta de estudiantes';
+
+--
+-- Volcado de datos para la tabla `reportes_buena_conducta`
+--
+
+INSERT INTO `reportes_buena_conducta` (`id`, `ID_Estudiante`, `ID_Reportado_por`, `Fecha_conducta`, `Tipo_reconocimiento`, `Categoria`, `Descripcion`, `Acciones_tomadas`, `Fecha_accion`, `Notificado_padres`, `Fecha_notificacion`, `Estado`, `Seguimiento`, `Puntos`, `Creado_en`) VALUES
+(1, 1, 2, '2026-02-10', 'Reconocimiento_conducta', 'Académico', 'Diego Vargas obtuvo el mejor puntaje en el examen parcial de Matemáticas con 100/100.', 'Mención verbal en clase y notificación a padres.', NULL, 1, NULL, 'Reconocido', NULL, 10, '2026-04-08 21:27:28'),
+(2, 4, 2, '2026-02-12', 'Participacion_destacada', 'Académico', 'Isabella Rojas participó activamente en la resolución de problemas en pizarra, ayudando a sus compañeros.', NULL, NULL, 0, NULL, 'Registrado', NULL, 5, '2026-04-08 21:27:28'),
+(3, 5, 3, '2026-02-05', 'Liderazgo', 'Comunitario', 'Mateo Castro organizó a su grupo en el proyecto de ciencias naturales, demostrando excelente liderazgo.', 'Diploma de reconocimiento al liderazgo estudiantil.', NULL, 1, NULL, 'Reconocido', NULL, 8, '2026-04-08 21:27:28');
+
+--
+-- Disparadores `reportes_buena_conducta`
+--
+DELIMITER $$
+CREATE TRIGGER `tr_rbc_insert` AFTER INSERT ON `reportes_buena_conducta` FOR EACH ROW BEGIN
+    INSERT INTO auditoria (ID_User, Accion, Tabla_afectada, ID_Registro_afectado, Datos_nuevos)
+    VALUES (
+        NEW.ID_Reportado_por,
+        'INSERT',
+        'reportes_buena_conducta',
+        NEW.id,
+        JSON_OBJECT(
+            'id_reporte',       NEW.id,
+            'id_estudiante',    NEW.ID_Estudiante,
+            'tipo',             NEW.Tipo_reconocimiento,
+            'categoria',        NEW.Categoria,
+            'fecha',            NEW.Fecha_conducta,
+            'puntos',           NEW.Puntos
+        )
+    );
+END
+$$
+DELIMITER ;
+DELIMITER $$
+CREATE TRIGGER `tr_rbc_update` AFTER UPDATE ON `reportes_buena_conducta` FOR EACH ROW BEGIN
+    INSERT INTO auditoria (ID_User, Accion, Tabla_afectada, ID_Registro_afectado, Datos_anteriores, Datos_nuevos)
+    VALUES (
+        NEW.ID_Reportado_por,
+        'UPDATE',
+        'reportes_buena_conducta',
+        NEW.id,
+        JSON_OBJECT('Estado', OLD.Estado, 'Puntos', OLD.Puntos),
+        JSON_OBJECT('Estado', NEW.Estado, 'Puntos', NEW.Puntos)
+    );
+END
+$$
+DELIMITER ;
+
+-- --------------------------------------------------------
+
+--
 -- Estructura de tabla para la tabla `reportes_disciplinarios`
 --
 
@@ -4140,7 +4766,7 @@ CREATE TABLE `roles` (
 --
 
 INSERT INTO `roles` (`id`, `Nombre`, `Descripcion`, `Nivel_acceso`, `Estado`, `Es_sistema`, `Creado_en`, `Actualizado_en`) VALUES
-(1, 'Administrador', 'Acceso total al sistema, puede gestionar usuarios y configuraciones', 5, 'Activo', 1, '2026-02-14 23:42:05', '2026-02-14 23:42:05'),
+(1, 'Admin', 'Acceso total al sistema, puede gestionar usuarios y configuraciones', 5, 'Activo', 1, '2026-02-14 23:42:05', '2026-04-21 19:23:54'),
 (2, 'Docente', 'Profesor con acceso a gestión académica, calificaciones y asistencias', 3, 'Activo', 1, '2026-02-14 23:42:05', '2026-02-14 23:42:05'),
 (3, 'Estudiante', 'Alumno con acceso a visualizar sus calificaciones y horarios', 1, 'Activo', 1, '2026-02-14 23:42:05', '2026-02-14 23:42:05'),
 (4, 'Padre_Tutor', 'Padre o tutor con acceso a información de sus hijos', 2, 'Activo', 1, '2026-02-14 23:42:05', '2026-02-14 23:42:05'),
@@ -4205,7 +4831,7 @@ INSERT INTO `users` (`id`, `ID_Persona`, `ID_Verificacion`, `ID_Rol`, `Correo`, 
 (18, 18, 18, 3, 'emma.morales@estudiante.colegio.edu.bo', '$2y$10$92IXUNpkjO0rOQ5byMi.Ye4oKoEa3Ro9llC/.og/at2.uheWG/igi', 'Activo', '2026-02-09 20:00:00', 0, '2026-02-15 18:27:25', '2026-02-15 18:27:25'),
 (19, 19, 19, 3, 'sebastian.torres@estudiante.colegio.edu.bo', '$2y$10$COFZ0Ml935KoioAN7ZigguwbrkcW9g.wUDwGUGqUls5NFkslLSnKi', 'Activo', '2026-02-08 21:00:00', 0, '2026-02-15 18:27:25', '2026-03-13 22:14:28'),
 (20, 20, 20, 3, 'lucia.mendoza@estudiante.colegio.edu.bo', '$2y$10$8F61dyK53hsszzl1AS1.ouVXd3qtZjaHK5J9st7RZ04Fx7EtiktwO', 'Activo', '2026-02-07 20:30:00', 0, '2026-02-15 18:27:25', '2026-03-13 22:17:14'),
-(21, 21, 69, 2, 'jazielarmandovargaschoque@gmail.com', '$2y$10$IrD8GWE5p6jnhbC5.LeXNuh7xIoAFmCJXf8Nht8PkZu0oHXGEMMFO', 'Activo', '2026-04-06 18:27:55', 0, '2026-02-15 22:11:05', '2026-04-06 18:43:53'),
+(21, 21, 73, 1, 'jazielarmandovargaschoque@gmail.com', '$2y$10$IrD8GWE5p6jnhbC5.LeXNuh7xIoAFmCJXf8Nht8PkZu0oHXGEMMFO', 'Activo', '2026-04-21 19:52:33', 0, '2026-02-15 22:11:05', '2026-04-21 19:52:33'),
 (23, 23, 22, 3, 'valentina.mamani@estudiante.colegio.edu.bo', '$2y$10$92IXUNpkjO0rOQ5byMi.Ye4oKoEa3Ro9llC/.og/at2.uheWG/igi', 'Activo', NULL, 0, '2026-03-15 20:30:07', '2026-03-15 20:30:07'),
 (24, 24, 23, 4, 'jorge.mamani@gmail.com', '$2y$10$92IXUNpkjO0rOQ5byMi.Ye4oKoEa3Ro9llC/.og/at2.uheWG/igi', 'Activo', NULL, 0, '2026-03-15 20:30:07', '2026-03-15 20:30:07'),
 (25, 25, 24, 4, 'rosa.torrez@gmail.com', '$2y$10$92IXUNpkjO0rOQ5byMi.Ye4oKoEa3Ro9llC/.og/at2.uheWG/igi', 'Activo', NULL, 0, '2026-03-15 20:30:07', '2026-03-15 20:30:07'),
@@ -4305,7 +4931,11 @@ INSERT INTO `verificacion` (`id`, `Fecha_verificacion`, `Tipo`, `Token`, `Estado
 (66, '2026-04-05 22:58:01', 'Email', '953966|eac320d1382a019de5c5065fc962cc21', 'Verificado', '2026-04-05 23:07:14'),
 (67, '2026-04-06 18:25:03', 'Email', '788833|9456c2a7c598cf03b154008240485ad0', 'Expirado', '2026-04-06 18:35:03'),
 (68, '2026-04-06 18:43:44', 'Email', '856690|0d8a8ed09b6c48ac3ec4f620b40e20ed', 'Expirado', '2026-04-06 18:53:44'),
-(69, '2026-04-06 18:43:53', 'Email', '177607|741910e11dfd1595ecd7d9b410995ff5', 'Pendiente', '2026-04-06 18:53:53');
+(69, '2026-04-06 18:43:53', 'Email', '177607|741910e11dfd1595ecd7d9b410995ff5', 'Expirado', '2026-04-06 18:53:53'),
+(70, '2026-04-21 19:21:17', 'Email', '777712|8d6c40c56f78297e1fd8da32c999982c', 'Verificado', '2026-04-21 19:31:00'),
+(71, '2026-04-21 19:24:37', 'Email', '173696|8d7d39e294f4294db2945a5ba85a4f84', 'Verificado', '2026-04-21 19:34:22'),
+(72, '2026-04-21 19:29:46', 'Email', '300810|a70901d6a1e63a4fb7997f517da526d3', 'Verificado', '2026-04-21 19:39:23'),
+(73, '2026-04-21 19:52:33', 'Email', '687153|ed00a177dec4a95d583d4f8994548b37', 'Verificado', '2026-04-21 20:02:10');
 
 -- --------------------------------------------------------
 
@@ -4360,6 +4990,54 @@ CREATE TABLE `v_asistencias_estudiante` (
 -- --------------------------------------------------------
 
 --
+-- Estructura Stand-in para la vista `v_balance_conducta_estudiante`
+-- (Véase abajo para la vista actual)
+--
+CREATE TABLE `v_balance_conducta_estudiante` (
+`ID_Estudiante` bigint(20)
+,`Codigo_estudiante` varchar(50)
+,`Nombre_Estudiante` varchar(511)
+,`Grado` varchar(100)
+,`Paralelo` varchar(10)
+,`Total_Reconocimientos` bigint(21)
+,`Total_Puntos_Positivos` decimal(32,0)
+,`Total_Anotaciones` bigint(21)
+,`Faltas_Graves` bigint(21)
+,`Balance_Neto` decimal(33,0)
+,`Clasificacion_Conducta` varchar(9)
+);
+
+-- --------------------------------------------------------
+
+--
+-- Estructura Stand-in para la vista `v_buena_conducta`
+-- (Véase abajo para la vista actual)
+--
+CREATE TABLE `v_buena_conducta` (
+`ID_Reconocimiento` bigint(20)
+,`Estudiante` varchar(511)
+,`Codigo_estudiante` varchar(50)
+,`Grado` varchar(100)
+,`Paralelo` varchar(10)
+,`Reconocido_Por` varchar(511)
+,`Rol_Reporta` varchar(50)
+,`Fecha_conducta` date
+,`Tipo_reconocimiento` enum('Felicitacion','Mencion_honor','Premio_academico','Premio_deportivo','Premio_artistico','Reconocimiento_conducta','Liderazgo','Solidaridad','Participacion_destacada','Otro')
+,`Categoria` varchar(100)
+,`Descripcion` text
+,`Acciones_tomadas` text
+,`Fecha_accion` date
+,`Puntos` int(11)
+,`Notificado_padres` tinyint(1)
+,`Fecha_notificacion` date
+,`Estado` enum('Registrado','En_proceso','Reconocido','Archivado')
+,`Seguimiento` text
+,`Fecha_Registro` timestamp
+);
+
+-- --------------------------------------------------------
+
+--
 -- Estructura Stand-in para la vista `v_crear_estudiante`
 -- (Véase abajo para la vista actual)
 --
@@ -4367,6 +5045,45 @@ CREATE TABLE `v_crear_estudiante` (
 `Instrucciones` varchar(34)
 ,`Nota` varchar(22)
 ,`Parametros` varchar(331)
+);
+
+-- --------------------------------------------------------
+
+--
+-- Estructura Stand-in para la vista `v_cursos`
+-- (Véase abajo para la vista actual)
+--
+CREATE TABLE `v_cursos` (
+`ID_Curso` bigint(20)
+,`Titulo` varchar(255)
+,`Tema` varchar(255)
+,`Descripcion` text
+,`Codigo_Materia` varchar(50)
+,`Materia` varchar(255)
+,`Area_conocimiento` varchar(100)
+,`Grado` varchar(100)
+,`Paralelo` varchar(10)
+,`Nivel_Educativo` varchar(100)
+,`Docente` varchar(511)
+,`Especialidad` varchar(255)
+,`Periodo` varchar(255)
+,`Numero_periodo` int(11)
+,`Anio_Academico` int(4)
+,`Fecha_programada` date
+,`Hora_inicio` time
+,`Hora_fin` time
+,`Aula` varchar(100)
+,`Tipo` enum('Teorica','Practica','Laboratorio','Evaluacion','Taller','Visita','Otro')
+,`Modalidad` enum('Presencial','Virtual','Hibrido')
+,`Estado` enum('Programado','En_curso','Realizado','Cancelado','Postergado')
+,`Recursos` text
+,`Objetivos` text
+,`Total_Asistencia_Registrada` bigint(21)
+,`Total_Presentes` bigint(21)
+,`Observaciones` text
+,`Registrado_Por` varchar(511)
+,`Creado_en` timestamp
+,`Actualizado_en` timestamp
 );
 
 -- --------------------------------------------------------
@@ -4820,11 +5537,38 @@ CREATE ALGORITHM=UNDEFINED DEFINER=`root`@`localhost` SQL SECURITY DEFINER VIEW 
 -- --------------------------------------------------------
 
 --
+-- Estructura para la vista `v_balance_conducta_estudiante`
+--
+DROP TABLE IF EXISTS `v_balance_conducta_estudiante`;
+
+CREATE ALGORITHM=UNDEFINED DEFINER=`` SQL SECURITY DEFINER VIEW `v_balance_conducta_estudiante`  AS SELECT `e`.`id` AS `ID_Estudiante`, `e`.`Codigo_estudiante` AS `Codigo_estudiante`, concat(`p`.`Nombre`,' ',`p`.`Apellido`) AS `Nombre_Estudiante`, `g`.`Nombre` AS `Grado`, `g`.`Paralelo` AS `Paralelo`, (select count(0) from `reportes_buena_conducta` `rbc` where `rbc`.`ID_Estudiante` = `e`.`id`) AS `Total_Reconocimientos`, (select ifnull(sum(`reportes_buena_conducta`.`Puntos`),0) from `reportes_buena_conducta` where `reportes_buena_conducta`.`ID_Estudiante` = `e`.`id`) AS `Total_Puntos_Positivos`, (select count(0) from `reportes_disciplinarios` `rd` where `rd`.`ID_Estudiante` = `e`.`id`) AS `Total_Anotaciones`, (select count(0) from `reportes_disciplinarios` `rd` where `rd`.`ID_Estudiante` = `e`.`id` and `rd`.`Tipo_falta` in ('Grave','Muy_grave')) AS `Faltas_Graves`, (select ifnull(sum(`reportes_buena_conducta`.`Puntos`),0) from `reportes_buena_conducta` where `reportes_buena_conducta`.`ID_Estudiante` = `e`.`id`) - (select count(0) * 5 from `reportes_disciplinarios` `rd` where `rd`.`ID_Estudiante` = `e`.`id` and `rd`.`Tipo_falta` in ('Grave','Muy_grave')) AS `Balance_Neto`, CASE WHEN (select count(0) from `reportes_disciplinarios` where `reportes_disciplinarios`.`ID_Estudiante` = `e`.`id` AND `reportes_disciplinarios`.`Estado` in ('Abierto','En_proceso') AND `reportes_disciplinarios`.`Tipo_falta` in ('Grave','Muy_grave')) > 0 THEN 'Crítico' WHEN (select count(0) from `reportes_disciplinarios` where `reportes_disciplinarios`.`ID_Estudiante` = `e`.`id` AND `reportes_disciplinarios`.`Estado` in ('Abierto','En_proceso')) > 3 THEN 'Atención' WHEN (select count(0) from `reportes_buena_conducta` where `reportes_buena_conducta`.`ID_Estudiante` = `e`.`id`) > 2 THEN 'Destacado' ELSE 'Normal' END AS `Clasificacion_Conducta` FROM ((((`estudiante` `e` join `users` `u` on(`e`.`ID_User` = `u`.`id`)) join `persona` `p` on(`u`.`ID_Persona` = `p`.`id`)) left join `matricula` `m` on(`e`.`id` = `m`.`ID_Estudiante` and `m`.`Estado_matricula` = 'Activa')) left join `grado` `g` on(`m`.`ID_Grado` = `g`.`id`)) WHERE `e`.`Estado` = 'Activo' ;
+
+-- --------------------------------------------------------
+
+--
+-- Estructura para la vista `v_buena_conducta`
+--
+DROP TABLE IF EXISTS `v_buena_conducta`;
+
+CREATE ALGORITHM=UNDEFINED DEFINER=`` SQL SECURITY DEFINER VIEW `v_buena_conducta`  AS SELECT `rbc`.`id` AS `ID_Reconocimiento`, concat(`pe`.`Nombre`,' ',`pe`.`Apellido`) AS `Estudiante`, `e`.`Codigo_estudiante` AS `Codigo_estudiante`, `g`.`Nombre` AS `Grado`, `g`.`Paralelo` AS `Paralelo`, concat(`pr`.`Nombre`,' ',`pr`.`Apellido`) AS `Reconocido_Por`, `ro`.`Nombre` AS `Rol_Reporta`, `rbc`.`Fecha_conducta` AS `Fecha_conducta`, `rbc`.`Tipo_reconocimiento` AS `Tipo_reconocimiento`, `rbc`.`Categoria` AS `Categoria`, `rbc`.`Descripcion` AS `Descripcion`, `rbc`.`Acciones_tomadas` AS `Acciones_tomadas`, `rbc`.`Fecha_accion` AS `Fecha_accion`, `rbc`.`Puntos` AS `Puntos`, `rbc`.`Notificado_padres` AS `Notificado_padres`, `rbc`.`Fecha_notificacion` AS `Fecha_notificacion`, `rbc`.`Estado` AS `Estado`, `rbc`.`Seguimiento` AS `Seguimiento`, `rbc`.`Creado_en` AS `Fecha_Registro` FROM ((((((((`reportes_buena_conducta` `rbc` join `estudiante` `e` on(`rbc`.`ID_Estudiante` = `e`.`id`)) join `users` `ue` on(`e`.`ID_User` = `ue`.`id`)) join `persona` `pe` on(`ue`.`ID_Persona` = `pe`.`id`)) join `users` `ur` on(`rbc`.`ID_Reportado_por` = `ur`.`id`)) join `persona` `pr` on(`ur`.`ID_Persona` = `pr`.`id`)) join `roles` `ro` on(`ur`.`ID_Rol` = `ro`.`id`)) left join `matricula` `m` on(`e`.`id` = `m`.`ID_Estudiante` and `m`.`Estado_matricula` = 'Activa')) left join `grado` `g` on(`m`.`ID_Grado` = `g`.`id`)) ORDER BY `rbc`.`Fecha_conducta` DESC ;
+
+-- --------------------------------------------------------
+
+--
 -- Estructura para la vista `v_crear_estudiante`
 --
 DROP TABLE IF EXISTS `v_crear_estudiante`;
 
 CREATE ALGORITHM=UNDEFINED DEFINER=`root`@`localhost` SQL SECURITY DEFINER VIEW `v_crear_estudiante`  AS SELECT 'USE_PROCEDURE: sp_crear_estudiante' AS `Instrucciones`, 'Parámetros requeridos:' AS `Nota`, 'p_nombre, p_apellido, p_ci, p_fecha_nacimiento, p_genero, p_direccion, p_telefono, \r\n     p_email_personal, p_correo, p_password, p_tipo_sangre, p_alergias, p_condiciones_medicas,\r\n     p_medicamentos, p_seguro_medico, p_numero_hermanos, p_posicion_hermanos, p_vive_con,\r\n     p_necesidades_especiales, p_transporte, p_nacionalidad' AS `Parametros` ;
+
+-- --------------------------------------------------------
+
+--
+-- Estructura para la vista `v_cursos`
+--
+DROP TABLE IF EXISTS `v_cursos`;
+
+CREATE ALGORITHM=UNDEFINED DEFINER=`` SQL SECURITY DEFINER VIEW `v_cursos`  AS SELECT `c`.`id` AS `ID_Curso`, `c`.`Titulo` AS `Titulo`, `c`.`Tema` AS `Tema`, `c`.`Descripcion` AS `Descripcion`, `mat`.`Codigo` AS `Codigo_Materia`, `mat`.`Nombre_de_la_materia` AS `Materia`, `mat`.`Area_conocimiento` AS `Area_conocimiento`, `g`.`Nombre` AS `Grado`, `g`.`Paralelo` AS `Paralelo`, `ne`.`Nombre` AS `Nivel_Educativo`, concat(`pd`.`Nombre`,' ',`pd`.`Apellido`) AS `Docente`, `d`.`Especialidad` AS `Especialidad`, `per`.`Nombre_periodo` AS `Periodo`, `per`.`Numero_periodo` AS `Numero_periodo`, `aa`.`Anio` AS `Anio_Academico`, `c`.`Fecha_programada` AS `Fecha_programada`, `c`.`Hora_inicio` AS `Hora_inicio`, `c`.`Hora_fin` AS `Hora_fin`, `c`.`Aula` AS `Aula`, `c`.`Tipo` AS `Tipo`, `c`.`Modalidad` AS `Modalidad`, `c`.`Estado` AS `Estado`, `c`.`Recursos` AS `Recursos`, `c`.`Objetivos` AS `Objetivos`, (select count(0) from `asistencia_curso` `ac` where `ac`.`ID_Curso` = `c`.`id`) AS `Total_Asistencia_Registrada`, (select count(0) from `asistencia_curso` `ac` where `ac`.`ID_Curso` = `c`.`id` and `ac`.`Estado` = 'Presente') AS `Total_Presentes`, `c`.`Observaciones` AS `Observaciones`, concat(`pu`.`Nombre`,' ',`pu`.`Apellido`) AS `Registrado_Por`, `c`.`Creado_en` AS `Creado_en`, `c`.`Actualizado_en` AS `Actualizado_en` FROM (((((((((((`cursos` `c` join `asignacion_docente` `ad` on(`c`.`ID_Asignacion` = `ad`.`id`)) join `materias` `mat` on(`ad`.`ID_Materia` = `mat`.`id`)) join `grado` `g` on(`ad`.`ID_Grado` = `g`.`id`)) join `nivel_educativo` `ne` on(`g`.`ID_Nivel_educativo` = `ne`.`id`)) join `docente` `d` on(`ad`.`ID_Docente` = `d`.`id`)) join `users` `ud` on(`d`.`ID_User` = `ud`.`id`)) join `persona` `pd` on(`ud`.`ID_Persona` = `pd`.`id`)) join `periodo` `per` on(`c`.`ID_Periodo` = `per`.`id`)) join `anio_academico` `aa` on(`c`.`ID_Anio_Academico` = `aa`.`id`)) left join `users` `ur` on(`c`.`Registrado_por` = `ur`.`id`)) left join `persona` `pu` on(`ur`.`ID_Persona` = `pu`.`id`)) ORDER BY `c`.`Fecha_programada` DESC, `c`.`Hora_inicio` ASC ;
 
 -- --------------------------------------------------------
 
@@ -5021,13 +5765,14 @@ ALTER TABLE `asistencias`
   ADD KEY `idx_fecha` (`Fecha`);
 
 --
--- Indices de la tabla `auditoria`
+-- Indices de la tabla `asistencia_curso`
 --
-ALTER TABLE `auditoria`
+ALTER TABLE `asistencia_curso`
   ADD PRIMARY KEY (`id`),
-  ADD KEY `Auditoria_ID_User_fkey` (`ID_User`),
-  ADD KEY `idx_fecha` (`Fecha_hora`),
-  ADD KEY `idx_tabla_accion` (`Tabla_afectada`,`Accion`);
+  ADD UNIQUE KEY `unique_curso_estudiante` (`ID_Curso`,`ID_Estudiante`),
+  ADD KEY `idx_curso` (`ID_Curso`),
+  ADD KEY `idx_estudiante` (`ID_Estudiante`),
+  ADD KEY `fk_asistencia_curso_reg` (`Registrado_por`);
 
 --
 -- Indices de la tabla `auditoria_calificaciones`
@@ -5083,6 +5828,18 @@ ALTER TABLE `comunicados`
   ADD PRIMARY KEY (`id`),
   ADD KEY `Comunicados_ID_Grado_fkey` (`ID_Grado`),
   ADD KEY `Comunicados_Creado_por_fkey` (`Creado_por`);
+
+--
+-- Indices de la tabla `cursos`
+--
+ALTER TABLE `cursos`
+  ADD PRIMARY KEY (`id`),
+  ADD KEY `idx_asignacion` (`ID_Asignacion`),
+  ADD KEY `idx_periodo` (`ID_Periodo`),
+  ADD KEY `idx_anio` (`ID_Anio_Academico`),
+  ADD KEY `idx_fecha_programada` (`Fecha_programada`),
+  ADD KEY `idx_estado` (`Estado`),
+  ADD KEY `fk_cursos_registrado` (`Registrado_por`);
 
 --
 -- Indices de la tabla `docente`
@@ -5234,6 +5991,17 @@ ALTER TABLE `plantel_administrativo`
   ADD UNIQUE KEY `unique_user_admin` (`ID_User`);
 
 --
+-- Indices de la tabla `reportes_buena_conducta`
+--
+ALTER TABLE `reportes_buena_conducta`
+  ADD PRIMARY KEY (`id`),
+  ADD KEY `idx_estudiante` (`ID_Estudiante`),
+  ADD KEY `idx_reportado` (`ID_Reportado_por`),
+  ADD KEY `idx_fecha` (`Fecha_conducta`),
+  ADD KEY `idx_tipo` (`Tipo_reconocimiento`),
+  ADD KEY `idx_estado` (`Estado`);
+
+--
 -- Indices de la tabla `reportes_disciplinarios`
 --
 ALTER TABLE `reportes_disciplinarios`
@@ -5303,10 +6071,10 @@ ALTER TABLE `asistencias`
   MODIFY `id` bigint(20) NOT NULL AUTO_INCREMENT, AUTO_INCREMENT=24;
 
 --
--- AUTO_INCREMENT de la tabla `auditoria`
+-- AUTO_INCREMENT de la tabla `asistencia_curso`
 --
-ALTER TABLE `auditoria`
-  MODIFY `id` bigint(20) NOT NULL AUTO_INCREMENT, AUTO_INCREMENT=26;
+ALTER TABLE `asistencia_curso`
+  MODIFY `id` bigint(20) NOT NULL AUTO_INCREMENT;
 
 --
 -- AUTO_INCREMENT de la tabla `auditoria_calificaciones`
@@ -5330,7 +6098,7 @@ ALTER TABLE `auditoria_personas`
 -- AUTO_INCREMENT de la tabla `auditoria_usuarios`
 --
 ALTER TABLE `auditoria_usuarios`
-  MODIFY `id` bigint(20) NOT NULL AUTO_INCREMENT, AUTO_INCREMENT=66;
+  MODIFY `id` bigint(20) NOT NULL AUTO_INCREMENT, AUTO_INCREMENT=81;
 
 --
 -- AUTO_INCREMENT de la tabla `calificaciones`
@@ -5342,6 +6110,12 @@ ALTER TABLE `calificaciones`
 -- AUTO_INCREMENT de la tabla `comunicados`
 --
 ALTER TABLE `comunicados`
+  MODIFY `id` bigint(20) NOT NULL AUTO_INCREMENT, AUTO_INCREMENT=4;
+
+--
+-- AUTO_INCREMENT de la tabla `cursos`
+--
+ALTER TABLE `cursos`
   MODIFY `id` bigint(20) NOT NULL AUTO_INCREMENT, AUTO_INCREMENT=4;
 
 --
@@ -5453,6 +6227,12 @@ ALTER TABLE `plantel_administrativo`
   MODIFY `id` bigint(20) NOT NULL AUTO_INCREMENT, AUTO_INCREMENT=3;
 
 --
+-- AUTO_INCREMENT de la tabla `reportes_buena_conducta`
+--
+ALTER TABLE `reportes_buena_conducta`
+  MODIFY `id` bigint(20) NOT NULL AUTO_INCREMENT, AUTO_INCREMENT=4;
+
+--
 -- AUTO_INCREMENT de la tabla `reportes_disciplinarios`
 --
 ALTER TABLE `reportes_disciplinarios`
@@ -5480,7 +6260,7 @@ ALTER TABLE `users`
 -- AUTO_INCREMENT de la tabla `verificacion`
 --
 ALTER TABLE `verificacion`
-  MODIFY `id` bigint(20) NOT NULL AUTO_INCREMENT, AUTO_INCREMENT=70;
+  MODIFY `id` bigint(20) NOT NULL AUTO_INCREMENT, AUTO_INCREMENT=74;
 
 --
 -- Restricciones para tablas volcadas
@@ -5510,10 +6290,12 @@ ALTER TABLE `asistencias`
   ADD CONSTRAINT `Asistencias_ID_Materia_fkey` FOREIGN KEY (`ID_Materia`) REFERENCES `materias` (`id`);
 
 --
--- Filtros para la tabla `auditoria`
+-- Filtros para la tabla `asistencia_curso`
 --
-ALTER TABLE `auditoria`
-  ADD CONSTRAINT `Auditoria_ID_User_fkey` FOREIGN KEY (`ID_User`) REFERENCES `users` (`id`);
+ALTER TABLE `asistencia_curso`
+  ADD CONSTRAINT `fk_asistencia_curso_curso` FOREIGN KEY (`ID_Curso`) REFERENCES `cursos` (`id`) ON DELETE CASCADE,
+  ADD CONSTRAINT `fk_asistencia_curso_est` FOREIGN KEY (`ID_Estudiante`) REFERENCES `estudiante` (`id`) ON DELETE CASCADE,
+  ADD CONSTRAINT `fk_asistencia_curso_reg` FOREIGN KEY (`Registrado_por`) REFERENCES `users` (`id`) ON DELETE SET NULL;
 
 --
 -- Filtros para la tabla `auditoria_usuarios`
@@ -5537,6 +6319,15 @@ ALTER TABLE `calificaciones`
 ALTER TABLE `comunicados`
   ADD CONSTRAINT `Comunicados_Creado_por_fkey` FOREIGN KEY (`Creado_por`) REFERENCES `users` (`id`),
   ADD CONSTRAINT `Comunicados_ID_Grado_fkey` FOREIGN KEY (`ID_Grado`) REFERENCES `grado` (`id`);
+
+--
+-- Filtros para la tabla `cursos`
+--
+ALTER TABLE `cursos`
+  ADD CONSTRAINT `fk_cursos_anio` FOREIGN KEY (`ID_Anio_Academico`) REFERENCES `anio_academico` (`id`),
+  ADD CONSTRAINT `fk_cursos_asignacion` FOREIGN KEY (`ID_Asignacion`) REFERENCES `asignacion_docente` (`id`) ON DELETE CASCADE,
+  ADD CONSTRAINT `fk_cursos_periodo` FOREIGN KEY (`ID_Periodo`) REFERENCES `periodo` (`id`),
+  ADD CONSTRAINT `fk_cursos_registrado` FOREIGN KEY (`Registrado_por`) REFERENCES `users` (`id`) ON DELETE SET NULL;
 
 --
 -- Filtros para la tabla `docente`
@@ -5632,6 +6423,13 @@ ALTER TABLE `periodo`
 --
 ALTER TABLE `plantel_administrativo`
   ADD CONSTRAINT `Plantel_administrativo_ID_User_fkey` FOREIGN KEY (`ID_User`) REFERENCES `users` (`id`) ON DELETE CASCADE;
+
+--
+-- Filtros para la tabla `reportes_buena_conducta`
+--
+ALTER TABLE `reportes_buena_conducta`
+  ADD CONSTRAINT `fk_rbc_estudiante` FOREIGN KEY (`ID_Estudiante`) REFERENCES `estudiante` (`id`) ON DELETE CASCADE,
+  ADD CONSTRAINT `fk_rbc_reportado` FOREIGN KEY (`ID_Reportado_por`) REFERENCES `users` (`id`);
 
 --
 -- Filtros para la tabla `reportes_disciplinarios`
